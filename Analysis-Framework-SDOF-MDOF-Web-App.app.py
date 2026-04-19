@@ -857,12 +857,13 @@ def plot_mode_shapes_like_original(result: DesignResult):
 
     n_modes = min(5, len(mr.mode_shapes))
     n_story = mr.n_dof
+    H = result.H_m
 
     fig, axes = plt.subplots(1, n_modes, figsize=(18, 6))
     if n_modes == 1:
         axes = [axes]
 
-    story_y = np.linspace(0, n_story - 1, n_story)
+    y = np.linspace(0.0, H, n_story)
 
     for m in range(n_modes):
         ax = axes[m]
@@ -871,18 +872,31 @@ def plot_mode_shapes_like_original(result: DesignResult):
         max_abs = max(np.max(np.abs(phi)), 1e-9)
         phi = phi / max_abs
 
-        ax.axvline(0.0, color="#bbbbbb", linestyle="--", linewidth=1.0)
-        for i in range(n_story):
-            ax.plot([-1.05, 1.05], [story_y[i], story_y[i]], color="#f0f0f0", linewidth=0.8)
+        if phi[-1] < 0:
+            phi = -phi
 
-        ax.plot(phi, story_y, color="#0b5ed7", linewidth=2)
-        ax.scatter(phi, story_y, color="#dc3545", s=18, zorder=3)
+        ax.axvline(0.0, color="#bbbbbb", linestyle="--", linewidth=1.0)
+
+        for yi in y:
+            ax.plot([-1.05, 1.05], [yi, yi], color="#f0f0f0", linewidth=0.8)
+
+        ax.plot(phi, y, color="#0b5ed7", linewidth=2)
+        ax.scatter(phi, y, color="#dc3545", s=18, zorder=3)
 
         ax.set_title(f"Mode {m+1}\nT = {mr.periods_s[m]:.3f} s", fontsize=11, fontweight="bold")
         ax.set_xlim(-1.1, 1.1)
+        ax.set_ylim(0.0, H)
+
+        
+        if m == 0:
+            ax.set_ylabel("Height (m)", fontsize=10)
+            ax.set_yticks([0.0, H])
+            ax.set_yticklabels([f"Base\n0.0", f"Roof\n{H:.1f}"])
+        else:
+            ax.set_yticks([])
+
         ax.set_xticks([])
-        ax.set_yticks([])
-        ax.invert_yaxis()
+
         for spine in ax.spines.values():
             spine.set_color("#999999")
             spine.set_linewidth(1.0)
