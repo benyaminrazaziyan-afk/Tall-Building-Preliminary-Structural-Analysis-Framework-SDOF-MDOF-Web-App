@@ -179,6 +179,7 @@ class DesignResult:
     reinforcement: ReinforcementEstimate
     optimization_success: bool
     optimization_message: str
+    target_position_factor: float
     core_scale: float
     column_scale: float
     messages: List[str] = field(default_factory=list)
@@ -767,6 +768,7 @@ def run_design(inp: BuildingInput) -> DesignResult:
         reinforcement=res["reinforcement"],
         optimization_success=bool(opt.success),
         optimization_message=str(opt.message),
+        target_position_factor=inp.target_position_factor,
         core_scale=core_scale,
         column_scale=col_scale,
         messages=messages,
@@ -783,6 +785,8 @@ def build_report(result: DesignResult) -> str:
     lines.append("-" * 74)
     lines.append(f"Reference period               = {result.reference_period_s:.3f} s")
     lines.append(f"Design target period           = {result.design_target_period_s:.3f} s")
+    lines.append(f"Target position factor beta    = {result.target_position_factor:.2f}")
+    lines.append(f"Target formula                 = T_target = T_ref + beta*(T_upper - T_ref)")
     lines.append(f"Estimated dynamic period       = {result.estimated_period_s:.3f} s")
     lines.append(f"Upper limit period             = {result.upper_limit_period_s:.3f} s")
     lines.append(f"Period error ratio             = {100*result.period_error_ratio:.2f} %")
@@ -1206,6 +1210,10 @@ with right_col:
         d1.metric("Period error (%)", f"{100*r.period_error_ratio:.2f}")
         d2.metric("Total stiffness (N/m)", f"{r.K_estimated_N_per_m:,.2e}")
         d3.metric("Top drift (m)", f"{r.top_drift_m:.3f}")
+
+        st.caption(
+            f"Target formula: T_target = T_ref + beta*(T_upper - T_ref)  |  beta = {r.target_position_factor:.2f}"
+        )
 
         tabs = st.tabs(["Graphic output", "Mass participation", "Report"])
         with tabs[0]:
