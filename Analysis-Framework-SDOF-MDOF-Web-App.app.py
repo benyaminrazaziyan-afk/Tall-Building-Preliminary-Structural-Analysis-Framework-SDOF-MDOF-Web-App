@@ -676,8 +676,8 @@ def solve_mdof_modes(inp: BuildingInput, total_weight_kN_value: float, K_total: 
     mode_shapes = []
     for i in range(min(n_modes, eigvecs.shape[1])):
         phi = eigvecs[:, i].reshape(-1, 1)
-        denom = float(phi.T @ M @ phi)
-        gamma = float((phi.T @ M @ ones) / denom)
+        denom = (phi.T @ M @ phi).item()
+gamma = ((phi.T @ M @ ones) / denom).item()
         meff = gamma**2 * denom
         ratio = meff / total_mass
         cum += ratio
