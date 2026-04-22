@@ -67,6 +67,7 @@ class BuildingInput:
     prelim_lateral_force_coeff: float
     drift_limit_ratio: float
     upper_period_factor: float
+    target_position_factor: float
     min_wall_thickness: float
     max_wall_thickness: float
     min_column_dim: float
@@ -610,10 +611,9 @@ def solve_mdof_modes(inp: BuildingInput, total_weight_kN_value: float, K_total: 
     )
 
 
-def adaptive_target_period(T_ref: float, T_upper: float, eta1: float) -> float:
-    alpha = 0.35 + 0.25 * (1.0 - eta1)
-    alpha = max(0.20, min(0.80, alpha))
-    return T_ref + alpha * (T_upper - T_ref)
+def adaptive_target_period(T_ref: float, T_upper: float, beta: float) -> float:
+    beta = max(0.10, min(0.95, float(beta)))
+    return T_ref + beta * (T_upper - T_ref)
 
 
 def generate_redesign_suggestions(inp: BuildingInput, T_est: float, T_target: float, T_limit: float, drift_ratio: float, drift_limit: float, core_scale: float, column_scale: float):
@@ -679,8 +679,7 @@ def run_design(inp: BuildingInput) -> DesignResult:
         ) = build_scaled_design(inp, core_scale, col_scale)
 
         modal = solve_mdof_modes(inp, W_total, K_est, n_modes=5)
-        eta1 = modal.effective_mass_ratios[0] if modal.effective_mass_ratios else 0.7
-        T_target = adaptive_target_period(T_ref, T_upper, eta1)
+        T_target = adaptive_target_period(T_ref, T_upper, inp.target_position_factor)
         T_est = modal.periods_s[0]
         period_error = abs(T_est - T_target) / max(T_target, 1e-9)
         top_drift = inp.prelim_lateral_force_coeff * W_total * 1000.0 / max(K_est, 1e-9)
@@ -819,6 +818,19 @@ def build_report(result: DesignResult) -> str:
         lines.append(f"  Gross Ieq                   = {zc.Ieq_gross_m4:,.2f} m^4")
         lines.append(f"  Effective Ieq               = {zc.Ieq_effective_m4:,.2f} m^4")
         lines.append(f"  Story slenderness           = {zc.story_slenderness:.2f}")
+    lines.append("")
+    lines.append("MATERIAL / QUANTITY SUMMARY")
+    lines.append("-" * 74)
+    r = result.reinforcement
+    lines.append(f"Wall concrete volume           = {r.wall_concrete_volume_m3:,.2f} m^3")
+    lines.append(f"Column concrete volume         = {r.column_concrete_volume_m3:,.2f} m^3")
+    lines.append(f"Beam concrete volume           = {r.beam_concrete_volume_m3:,.2f} m^3")
+    lines.append(f"Slab concrete volume           = {r.slab_concrete_volume_m3:,.2f} m^3")
+    lines.append(f"Wall steel                     = {r.wall_steel_kg:,.0f} kg")
+    lines.append(f"Column steel                   = {r.column_steel_kg:,.0f} kg")
+    lines.append(f"Beam steel                     = {r.beam_steel_kg:,.0f} kg")
+    lines.append(f"Slab steel                     = {r.slab_steel_kg:,.0f} kg")
+    lines.append(f"Total steel                    = {r.total_steel_kg:,.0f} kg")
     lines.append("")
     lines.append("OPTIMIZATION STATUS")
     lines.append("-" * 74)
@@ -1035,6 +1047,7 @@ def input_panel() -> BuildingInput:
     with c5:
         prelim_lateral_force_coeff = st.number_input("Prelim lateral coeff", 0.001, 0.100, 0.015, format="%.3f")
         upper_period_factor = st.number_input("Upper period factor", 1.0, 3.0, 2.0, format="%.2f")
+        target_position_factor = st.number_input("Target position factor", 0.10, 0.95, 0.85, step=0.05, format="%.2f")
         min_wall_thickness = st.number_input("Min wall thickness (m)", 0.1, 2.0, 0.3)
         min_column_dim = st.number_input("Min column dimension (m)", 0.1, 3.0, 0.7)
         min_beam_width = st.number_input("Min beam width (m)", 0.1, 3.0, 0.4)
@@ -1088,6 +1101,7 @@ def input_panel() -> BuildingInput:
         prelim_lateral_force_coeff=float(prelim_lateral_force_coeff),
         drift_limit_ratio=1.0 / float(drift_denominator),
         upper_period_factor=float(upper_period_factor),
+        target_position_factor=float(target_position_factor),
         min_wall_thickness=float(min_wall_thickness),
         max_wall_thickness=float(max_wall_thickness),
         min_column_dim=float(min_column_dim),
