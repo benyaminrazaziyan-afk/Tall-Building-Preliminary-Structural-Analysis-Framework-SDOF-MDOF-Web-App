@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from math import pi, sqrt
 from typing import List, Tuple
 
@@ -9,12 +9,17 @@ import scipy.optimize as opt
 import streamlit as st
 
 # ----------------------------- CONFIG -----------------------------
-st.set_page_config(page_title="Tall Building Structural Analysis", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="Tall Building Structural Analysis",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 DEFAULT_AUTHOR_NAME = "Benyamin"
-APP_VERSION = "v3.0-optimized"
+APP_VERSION = "v3.1-fixed"
 
 G = 9.81
+CONCRETE_UNIT_WEIGHT_KN_M3 = 25.0
 STEEL_DENSITY = 7850.0
 
 CORNER_COLOR = "#8b0000"
@@ -22,6 +27,7 @@ PERIM_COLOR = "#cc5500"
 INTERIOR_COLOR = "#4444aa"
 CORE_COLOR = "#2e8b57"
 PERIM_WALL_COLOR = "#4caf50"
+
 
 # ----------------------------- DATA MODELS -----------------------------
 @dataclass
@@ -50,9 +56,9 @@ class BuildingInput:
     bay_y: float
 
     stair_count: int = 2
-    elevator_count: int = 8
+    elevator_count: int = 4
     elevator_area_each: float = 3.5
-    stair_area_each: float = 14.0
+    stair_area_each: float = 20.0
     service_area: float = 35.0
     corridor_factor: float = 1.40
 
@@ -60,15 +66,14 @@ class BuildingInput:
     Ec: float = 36000.0
     fy: float = 420.0
 
-    DL: float = 6.5
+    DL: float = 3.0
     LL: float = 2.5
     slab_finish_allowance: float = 1.5
-    facade_line_load: float = 14.0
+    facade_line_load: float = 1.0
 
     prelim_lateral_force_coeff: float = 0.015
     drift_limit_ratio: float = 1 / 500
     period_limit_factor: float = 1.40
-    max_period_factor_over_target: float = 1.25
 
     min_wall_thickness: float = 0.30
     max_wall_thickness: float = 1.20
@@ -182,11 +187,12 @@ class DesignResult:
     floor_area_m2: float
     total_weight_kN: float
     effective_modal_mass_kg: float
-    T_code_s: float
-    T_limit_s: float
-    period_ok: bool
-    T_target_s: float
-    T_est_s: float
+    reference_period_s: float
+    design_target_period_s: float
+    upper_limit_period_s: float
+    estimated_dynamic_period_s: float
+    period_error_ratio: float
+    period_within_limit: bool
     K_required_N_per_m: float
     K_core_N_per_m: float
     K_columns_N_per_m: float
@@ -199,8 +205,8 @@ class DesignResult:
     beam_width_m: float
     beam_depth_m: float
     reinforcement: ReinforcementEstimate
-    system_assessment: str
     optimization: OptimizationResult
+    system_assessment: str
     messages: List[str] = field(default_factory=list)
     modal_result: ModalResult | None = None
 
@@ -216,6 +222,12 @@ def floor_area(inp: BuildingInput) -> float:
     return inp.plan_x * inp.plan_y
 
 
+def building_perimeter(inp: BuildingInput) -> float:
+    if inp.plan_shape == "triangle":
+        return inp.plan_x + inp.plan_y + (inp.plan_x**2 + inp.plan_y**2) ** 0.5
+    return 2.0 * (inp.plan_x + inp.plan_y)
+
+
 def slab_thickness_prelim(inp: BuildingInput) -> float:
     span = max(inp.bay_x, inp.bay_y)
     return max(inp.min_slab_thickness, min(inp.max_slab_thickness, span / 28.0))
@@ -228,50 +240,8 @@ def beam_size_prelim(inp: BuildingInput) -> tuple[float, float]:
     return width, depth
 
 
-def code_type_period(H: float, Ct: float, x_period: float) -> float:
-    return Ct * (H ** x_period)
-
-
-def total_weight_kN(inp: BuildingInput, slab_t: float) -> float:
-    A = floor_area(inp)
-    perimeter = (
-        2.0 * (inp.plan_x + inp.plan_y)
-        if inp.plan_shape == "square"
-        else (inp.plan_x + inp.plan_y + (inp.plan_x**2 + inp.plan_y**2) ** 0.5)
-    )
-    slab_self_weight = slab_t * 25.0
-    floor_load = inp.DL + inp.LL + inp.slab_finish_allowance + slab_self_weight
-    above_grade = floor_load * A * inp.n_story
-    basement = 1.10 * floor_load * A * inp.n_basement
-    facade = inp.facade_line_load * perimeter * inp.n_story
-    structure_allowance = 0.12 * (above_grade + basement)
-    return (above_grade + basement + facade + structure_allowance) * inp.seismic_mass_factor
-
-
-def effective_modal_mass(total_weight_kN_value: float, ratio: float) -> float:
-    return ratio * total_weight_kN_value * 1000.0 / G
-
-
-def required_stiffness(M_eff: float, T_target: float) -> float:
-    return 4.0 * pi**2 * M_eff / (T_target**2)
-
-
-def preliminary_lateral_force_N(inp: BuildingInput, W_total_kN: float) -> float:
-    return inp.prelim_lateral_force_coeff * W_total_kN * 1000.0
-
-
-def cantilever_tip_stiffness(EI: float, H: float) -> float:
-    return 3.0 * EI / (H**3)
-
-
-def define_three_zones(n_story: int) -> List[ZoneDefinition]:
-    z1 = max(1, round(0.30 * n_story))
-    z2 = max(z1 + 1, round(0.70 * n_story))
-    return [
-        ZoneDefinition("Lower Zone", 1, z1),
-        ZoneDefinition("Middle Zone", z1 + 1, z2),
-        ZoneDefinition("Upper Zone", z2 + 1, n_story),
-    ]
+def reference_period(inp: BuildingInput) -> float:
+    return inp.Ct * (total_height(inp) ** inp.x_period)
 
 
 def required_opening_area(inp: BuildingInput) -> float:
@@ -295,6 +265,16 @@ def initial_core_dimensions(inp: BuildingInput, opening_x: float, opening_y: flo
     return min(outer_x, 0.42 * inp.plan_x), min(outer_y, 0.42 * inp.plan_y)
 
 
+def define_three_zones(n_story: int) -> List[ZoneDefinition]:
+    z1 = max(1, round(0.30 * n_story))
+    z2 = max(z1 + 1, round(0.70 * n_story))
+    return [
+        ZoneDefinition("Lower Zone", 1, z1),
+        ZoneDefinition("Middle Zone", z1 + 1, z2),
+        ZoneDefinition("Upper Zone", z2 + 1, n_story),
+    ]
+
+
 def active_wall_count_by_zone(inp: BuildingInput, zone_name: str) -> int:
     if zone_name == "Lower Zone":
         return inp.lower_zone_wall_count
@@ -314,47 +294,47 @@ def wall_lengths_for_layout(outer_x: float, outer_y: float, wall_count: int) -> 
 
 
 def wall_rect_inertia_about_global_y(length: float, thickness: float, x_centroid: float) -> float:
-    I_local = length * thickness**3 / 12.0
+    i_local = length * thickness**3 / 12.0
     area = length * thickness
-    return I_local + area * x_centroid**2
+    return i_local + area * x_centroid**2
 
 
 def wall_rect_inertia_about_global_x(length: float, thickness: float, y_centroid: float) -> float:
-    I_local = length * thickness**3 / 12.0
+    i_local = length * thickness**3 / 12.0
     area = length * thickness
-    return I_local + area * y_centroid**2
+    return i_local + area * y_centroid**2
 
 
 def core_equivalent_inertia(outer_x: float, outer_y: float, lengths: List[float], t: float, wall_count: int) -> float:
     x_side = outer_x / 2.0
     y_side = outer_y / 2.0
     top_len, bot_len, left_len, right_len = lengths[0], lengths[1], lengths[2], lengths[3]
-    I_x = 0.0
-    I_y = 0.0
+    i_x = 0.0
+    i_y = 0.0
 
-    I_x += wall_rect_inertia_about_global_x(top_len, t, +y_side)
-    I_x += wall_rect_inertia_about_global_x(bot_len, t, -y_side)
-    I_y += (t * top_len**3 / 12.0) + (t * bot_len**3 / 12.0)
+    i_x += wall_rect_inertia_about_global_x(top_len, t, +y_side)
+    i_x += wall_rect_inertia_about_global_x(bot_len, t, -y_side)
+    i_y += (t * top_len**3 / 12.0) + (t * bot_len**3 / 12.0)
 
-    I_y += wall_rect_inertia_about_global_y(left_len, t, -x_side)
-    I_y += wall_rect_inertia_about_global_y(right_len, t, +x_side)
-    I_x += (t * left_len**3 / 12.0) + (t * right_len**3 / 12.0)
+    i_y += wall_rect_inertia_about_global_y(left_len, t, -x_side)
+    i_y += wall_rect_inertia_about_global_y(right_len, t, +x_side)
+    i_x += (t * left_len**3 / 12.0) + (t * right_len**3 / 12.0)
 
     if wall_count >= 6:
         inner_x = 0.22 * outer_x
         l1, l2 = lengths[4], lengths[5]
-        I_y += wall_rect_inertia_about_global_y(l1, t, -inner_x)
-        I_y += wall_rect_inertia_about_global_y(l2, t, +inner_x)
-        I_x += (t * l1**3 / 12.0) + (t * l2**3 / 12.0)
+        i_y += wall_rect_inertia_about_global_y(l1, t, -inner_x)
+        i_y += wall_rect_inertia_about_global_y(l2, t, +inner_x)
+        i_x += (t * l1**3 / 12.0) + (t * l2**3 / 12.0)
 
     if wall_count >= 8:
         inner_y = 0.22 * outer_y
         l3, l4 = lengths[6], lengths[7]
-        I_x += wall_rect_inertia_about_global_x(l3, t, -inner_y)
-        I_x += wall_rect_inertia_about_global_x(l4, t, +inner_y)
-        I_y += (t * l3**3 / 12.0) + (t * l4**3 / 12.0)
+        i_x += wall_rect_inertia_about_global_x(l3, t, -inner_y)
+        i_x += wall_rect_inertia_about_global_x(l4, t, +inner_y)
+        i_y += (t * l3**3 / 12.0) + (t * l4**3 / 12.0)
 
-    return min(I_x, I_y)
+    return min(i_x, i_y)
 
 
 def wall_thickness_by_zone(inp: BuildingInput, H: float, zone: ZoneDefinition) -> float:
@@ -368,13 +348,23 @@ def wall_thickness_by_zone(inp: BuildingInput, H: float, zone: ZoneDefinition) -
 
 def perimeter_wall_segments_for_square(inp: BuildingInput, zone: ZoneDefinition) -> List[Tuple[str, float, float]]:
     if zone.name == "Lower Zone":
-        return [("top", 0.0, inp.plan_x), ("bottom", 0.0, inp.plan_x), ("left", 0.0, inp.plan_y), ("right", 0.0, inp.plan_y)]
+        return [
+            ("top", 0.0, inp.plan_x),
+            ("bottom", 0.0, inp.plan_x),
+            ("left", 0.0, inp.plan_y),
+            ("right", 0.0, inp.plan_y),
+        ]
     ratio = inp.perimeter_shear_wall_ratio
     lx = inp.plan_x * ratio
     ly = inp.plan_y * ratio
     sx = (inp.plan_x - lx) / 2.0
     sy = (inp.plan_y - ly) / 2.0
-    return [("top", sx, sx + lx), ("bottom", sx, sx + lx), ("left", sy, sy + ly), ("right", sy, sy + ly)]
+    return [
+        ("top", sx, sx + lx),
+        ("bottom", sx, sx + lx),
+        ("left", sy, sy + ly),
+        ("right", sy, sy + ly),
+    ]
 
 
 def perimeter_wall_segments_for_triangle(inp: BuildingInput, zone: ZoneDefinition) -> List[Tuple[str, float, float]]:
@@ -385,27 +375,6 @@ def perimeter_wall_segments_for_triangle(inp: BuildingInput, zone: ZoneDefinitio
     return [("edge1", s, s + ratio), ("edge2", s, s + ratio), ("edge3", s, s + ratio)]
 
 
-# ----------------------------- PRELIMINARY SIZING -----------------------------
-def design_core_by_zone(inp: BuildingInput, zones: List[ZoneDefinition]) -> List[ZoneCoreResult]:
-    opening_x, opening_y = opening_dimensions(inp)
-    outer_x, outer_y = initial_core_dimensions(inp, opening_x, opening_y)
-    H = total_height(inp)
-    results = []
-    for zone in zones:
-        wall_count = active_wall_count_by_zone(inp, zone.name)
-        lengths = wall_lengths_for_layout(outer_x, outer_y, wall_count)
-        t = wall_thickness_by_zone(inp, H, zone)
-        I_gross = core_equivalent_inertia(outer_x, outer_y, lengths, t, wall_count)
-        I_eff = inp.wall_cracked_factor * I_gross
-        perim = perimeter_wall_segments_for_triangle(inp, zone) if inp.plan_shape == "triangle" else perimeter_wall_segments_for_square(inp, zone)
-        results.append(ZoneCoreResult(zone=zone, wall_count=wall_count, wall_lengths=lengths, wall_thickness=t,
-                                      core_outer_x=outer_x, core_outer_y=outer_y, core_opening_x=opening_x,
-                                      core_opening_y=opening_y, Ieq_gross_m4=I_gross, Ieq_effective_m4=I_eff,
-                                      story_slenderness=inp.story_height / t, perimeter_wall_segments=perim,
-                                      retaining_wall_active=(zone.name == "Lower Zone")))
-    return results
-
-
 def directional_column_dims(base_dim: float, corner_factor: float, perimeter_factor: float, plan_x: float, plan_y: float, col_type: str) -> tuple[float, float]:
     aspect = max(plan_x, plan_y) / max(min(plan_x, plan_y), 1e-9)
     if col_type == "interior":
@@ -414,15 +383,17 @@ def directional_column_dims(base_dim: float, corner_factor: float, perimeter_fac
         nominal = base_dim * perimeter_factor
     else:
         nominal = base_dim * corner_factor
+
     if aspect <= 1.10:
         return nominal, nominal
+
     major = nominal * 1.15
     minor = nominal * 0.90
     return (major, minor) if plan_x >= plan_y else (minor, major)
 
 
-def estimate_zone_column_sizes(inp: BuildingInput, zones: List[ZoneDefinition], slab_t: float) -> List[ZoneColumnResult]:
-    q = inp.DL + inp.LL + inp.slab_finish_allowance + slab_t * 25.0
+def estimate_zone_column_sizes(inp: BuildingInput, zones: List[ZoneDefinition], slab_t: float, lambda_col: float = 1.0) -> List[ZoneColumnResult]:
+    q = inp.DL + inp.LL + inp.slab_finish_allowance + slab_t * CONCRETE_UNIT_WEIGHT_KN_M3
     sigma_allow = 0.35 * inp.fck * 1000.0
     results = []
 
@@ -454,7 +425,8 @@ def estimate_zone_column_sizes(inp: BuildingInput, zones: List[ZoneDefinition], 
         tributary_corner = 0.25 * inp.bay_x * inp.bay_y
 
         P_interior = tributary_interior * q * n_effective * 1.18
-        interior_dim = min(inp.max_column_dim, max(inp.min_column_dim, sqrt(P_interior / sigma_allow)))
+        base_dim = min(inp.max_column_dim, max(inp.min_column_dim, sqrt(P_interior / sigma_allow)))
+        interior_dim = min(inp.max_column_dim, max(inp.min_column_dim, base_dim * lambda_col))
         perimeter_dim = min(inp.max_column_dim, max(inp.min_column_dim, interior_dim * inp.perimeter_column_factor))
         corner_dim = min(inp.max_column_dim, max(inp.min_column_dim, interior_dim * inp.corner_column_factor))
         P_perimeter = tributary_perimeter * q * n_effective * 1.18
@@ -464,83 +436,69 @@ def estimate_zone_column_sizes(inp: BuildingInput, zones: List[ZoneDefinition], 
         perimeter_x, perimeter_y = directional_column_dims(interior_dim, inp.corner_column_factor, inp.perimeter_column_factor, inp.plan_x, inp.plan_y, "perimeter")
         corner_x, corner_y = directional_column_dims(interior_dim, inp.corner_column_factor, inp.perimeter_column_factor, inp.plan_x, inp.plan_y, "corner")
 
+        A_corner = corner_x * corner_y
+        A_perim = perimeter_x * perimeter_y
+        A_inter = interior_x * interior_y
         Iavg_corner = max(corner_x * corner_y**3 / 12.0, corner_y * corner_x**3 / 12.0)
         Iavg_perim = max(perimeter_x * perimeter_y**3 / 12.0, perimeter_y * perimeter_x**3 / 12.0)
         Iavg_inter = max(interior_x * interior_y**3 / 12.0, interior_y * interior_x**3 / 12.0)
-        A_avg = (corner_cols * corner_x * corner_y + perimeter_cols * perimeter_x * perimeter_y + interior_cols * interior_x * interior_y) / max(total_columns, 1)
         I_avg = (corner_cols * Iavg_corner + perimeter_cols * Iavg_perim + interior_cols * Iavg_inter) / max(total_columns, 1)
+        A_avg = (corner_cols * A_corner + perimeter_cols * A_perim + interior_cols * A_inter) / max(total_columns, 1)
         I_col_group = inp.column_cracked_factor * (I_avg * max(total_columns, 1) + A_avg * r2_sum)
 
-        results.append(ZoneColumnResult(zone=zone, corner_column_m=corner_dim, perimeter_column_m=perimeter_dim, interior_column_m=interior_dim,
-                                        corner_column_x_m=corner_x, corner_column_y_m=corner_y,
-                                        perimeter_column_x_m=perimeter_x, perimeter_column_y_m=perimeter_y,
-                                        interior_column_x_m=interior_x, interior_column_y_m=interior_y,
-                                        P_corner_kN=P_corner, P_perimeter_kN=P_perimeter, P_interior_kN=P_interior,
-                                        I_col_group_effective_m4=I_col_group))
+        results.append(
+            ZoneColumnResult(
+                zone=zone,
+                corner_column_m=corner_dim,
+                perimeter_column_m=perimeter_dim,
+                interior_column_m=interior_dim,
+                corner_column_x_m=corner_x,
+                corner_column_y_m=corner_y,
+                perimeter_column_x_m=perimeter_x,
+                perimeter_column_y_m=perimeter_y,
+                interior_column_x_m=interior_x,
+                interior_column_y_m=interior_y,
+                P_corner_kN=P_corner,
+                P_perimeter_kN=P_perimeter,
+                P_interior_kN=P_interior,
+                I_col_group_effective_m4=I_col_group,
+            )
+        )
     return results
 
 
-def count_columns(inp: BuildingInput) -> tuple[int, int, int, int, float]:
-    if inp.plan_shape == "triangle":
-        total_columns = (inp.n_bays_x + 1) * (inp.n_bays_y + 1) // 2 + 3
-        corner_cols = 3
-        perimeter_cols = max(6, inp.n_bays_x + inp.n_bays_y)
-        interior_cols = max(0, total_columns - corner_cols - perimeter_cols)
-        r2_sum = 0.35 * inp.plan_x * inp.plan_y * max(total_columns, 1)
-    else:
-        total_columns = (inp.n_bays_x + 1) * (inp.n_bays_y + 1)
-        corner_cols = 4
-        perimeter_cols = max(0, 2 * (inp.n_bays_x - 1) + 2 * (inp.n_bays_y - 1))
-        interior_cols = max(0, total_columns - corner_cols - perimeter_cols)
-        plan_center_x = inp.plan_x / 2.0
-        plan_center_y = inp.plan_y / 2.0
-        r2_sum = 0.0
-        for i in range(inp.n_bays_x + 1):
-            for j in range(inp.n_bays_y + 1):
-                x = i * inp.bay_x
-                y = j * inp.bay_y
-                r2_sum += (x - plan_center_x) ** 2 + (y - plan_center_y) ** 2
-    return total_columns, corner_cols, perimeter_cols, interior_cols, r2_sum
+def design_core_by_zone(inp: BuildingInput, zones: List[ZoneDefinition], lambda_core: float = 1.0) -> List[ZoneCoreResult]:
+    opening_x, opening_y = opening_dimensions(inp)
+    outer_x, outer_y = initial_core_dimensions(inp, opening_x, opening_y)
+    H = total_height(inp)
+    results = []
 
-
-# ----------------------------- SCALING + OPTIMIZATION -----------------------------
-def scale_core_results(inp: BuildingInput, base_cores: List[ZoneCoreResult], lambda_core: float) -> List[ZoneCoreResult]:
-    scaled = []
-    for z in base_cores:
-        t = min(inp.max_wall_thickness, max(inp.min_wall_thickness, z.wall_thickness * lambda_core))
-        I_gross = core_equivalent_inertia(z.core_outer_x, z.core_outer_y, z.wall_lengths, t, z.wall_count)
+    for zone in zones:
+        wall_count = active_wall_count_by_zone(inp, zone.name)
+        lengths = wall_lengths_for_layout(outer_x, outer_y, wall_count)
+        t_base = wall_thickness_by_zone(inp, H, zone)
+        t = min(inp.max_wall_thickness, max(inp.min_wall_thickness, t_base * lambda_core))
+        I_gross = core_equivalent_inertia(outer_x, outer_y, lengths, t, wall_count)
         I_eff = inp.wall_cracked_factor * I_gross
-        scaled.append(replace(z, wall_thickness=t, Ieq_gross_m4=I_gross, Ieq_effective_m4=I_eff, story_slenderness=inp.story_height / t))
-    return scaled
-
-
-def scale_column_results(inp: BuildingInput, base_cols: List[ZoneColumnResult], lambda_col: float) -> List[ZoneColumnResult]:
-    total_columns, corner_cols, perimeter_cols, interior_cols, r2_sum = count_columns(inp)
-    scaled = []
-    for z in base_cols:
-        corner_x = min(inp.max_column_dim, max(inp.min_column_dim, z.corner_column_x_m * lambda_col))
-        corner_y = min(inp.max_column_dim, max(inp.min_column_dim, z.corner_column_y_m * lambda_col))
-        perimeter_x = min(inp.max_column_dim, max(inp.min_column_dim, z.perimeter_column_x_m * lambda_col))
-        perimeter_y = min(inp.max_column_dim, max(inp.min_column_dim, z.perimeter_column_y_m * lambda_col))
-        interior_x = min(inp.max_column_dim, max(inp.min_column_dim, z.interior_column_x_m * lambda_col))
-        interior_y = min(inp.max_column_dim, max(inp.min_column_dim, z.interior_column_y_m * lambda_col))
-
-        Iavg_corner = max(corner_x * corner_y**3 / 12.0, corner_y * corner_x**3 / 12.0)
-        Iavg_perim = max(perimeter_x * perimeter_y**3 / 12.0, perimeter_y * perimeter_x**3 / 12.0)
-        Iavg_inter = max(interior_x * interior_y**3 / 12.0, interior_y * interior_x**3 / 12.0)
-        A_avg = (corner_cols * corner_x * corner_y + perimeter_cols * perimeter_x * perimeter_y + interior_cols * interior_x * interior_y) / max(total_columns, 1)
-        I_avg = (corner_cols * Iavg_corner + perimeter_cols * Iavg_perim + interior_cols * Iavg_inter) / max(total_columns, 1)
-        I_col_group = inp.column_cracked_factor * (I_avg * max(total_columns, 1) + A_avg * r2_sum)
-
-        scaled.append(replace(z,
-                              corner_column_m=max(corner_x, corner_y),
-                              perimeter_column_m=max(perimeter_x, perimeter_y),
-                              interior_column_m=max(interior_x, interior_y),
-                              corner_column_x_m=corner_x, corner_column_y_m=corner_y,
-                              perimeter_column_x_m=perimeter_x, perimeter_column_y_m=perimeter_y,
-                              interior_column_x_m=interior_x, interior_column_y_m=interior_y,
-                              I_col_group_effective_m4=I_col_group))
-    return scaled
+        perim = perimeter_wall_segments_for_triangle(inp, zone) if inp.plan_shape == "triangle" else perimeter_wall_segments_for_square(inp, zone)
+        results.append(
+            ZoneCoreResult(
+                zone=zone,
+                wall_count=wall_count,
+                wall_lengths=lengths,
+                wall_thickness=t,
+                core_outer_x=outer_x,
+                core_outer_y=outer_y,
+                core_opening_x=opening_x,
+                core_opening_y=opening_y,
+                Ieq_gross_m4=I_gross,
+                Ieq_effective_m4=I_eff,
+                story_slenderness=inp.story_height / t,
+                perimeter_wall_segments=perim,
+                retaining_wall_active=(zone.name == "Lower Zone"),
+            )
+        )
+    return results
 
 
 def weighted_core_stiffness(inp: BuildingInput, zone_cores: List[ZoneCoreResult]) -> float:
@@ -552,7 +510,7 @@ def weighted_core_stiffness(inp: BuildingInput, zone_cores: List[ZoneCoreResult]
         perimeter_bonus = 1.0 + 0.20 * len(zc.perimeter_wall_segments)
         total_flex_factor += (hi / H) / max(E * zc.Ieq_effective_m4 * perimeter_bonus, 1e-9)
     EI_equiv = 1.0 / max(total_flex_factor, 1e-18)
-    return cantilever_tip_stiffness(EI_equiv, H)
+    return 3.0 * EI_equiv / H**3
 
 
 def weighted_column_stiffness(inp: BuildingInput, zone_cols: List[ZoneColumnResult]) -> float:
@@ -563,7 +521,7 @@ def weighted_column_stiffness(inp: BuildingInput, zone_cols: List[ZoneColumnResu
         hi = zc.zone.n_stories * inp.story_height
         total_flex_factor += (hi / H) / max(E * zc.I_col_group_effective_m4, 1e-9)
     EI_equiv = 1.0 / max(total_flex_factor, 1e-18)
-    return cantilever_tip_stiffness(EI_equiv, H)
+    return 3.0 * EI_equiv / H**3
 
 
 def estimate_reinforcement(inp: BuildingInput, zone_cores: List[ZoneCoreResult], zone_cols: List[ZoneColumnResult], slab_t: float, beam_b: float, beam_h: float) -> ReinforcementEstimate:
@@ -581,7 +539,17 @@ def estimate_reinforcement(inp: BuildingInput, zone_cores: List[ZoneCoreResult],
             for side, a, b in zc.perimeter_wall_segments:
                 wall_concrete += perim_lengths[side] * (b - a) * zc.wall_thickness * (zc.zone.n_stories * inp.story_height)
 
-    total_cols, corner_cols, perimeter_cols, interior_cols, _ = count_columns(inp)
+    if inp.plan_shape == "triangle":
+        corner_cols = 3
+        perimeter_cols = max(6, inp.n_bays_x + inp.n_bays_y)
+        total_cols = (inp.n_bays_x + 1) * (inp.n_bays_y + 1) // 2 + 3
+        interior_cols = max(0, total_cols - corner_cols - perimeter_cols)
+    else:
+        corner_cols = 4
+        perimeter_cols = max(0, 2 * (inp.n_bays_x - 1) + 2 * (inp.n_bays_y - 1))
+        total_cols = (inp.n_bays_x + 1) * (inp.n_bays_y + 1)
+        interior_cols = max(0, total_cols - corner_cols - perimeter_cols)
+
     column_concrete = 0.0
     for zc in zone_cols:
         zone_height = zc.zone.n_stories * inp.story_height
@@ -616,142 +584,28 @@ def estimate_reinforcement(inp: BuildingInput, zone_cores: List[ZoneCoreResult],
     )
 
 
+def total_weight_kN_coupled(inp: BuildingInput, slab_t: float, reinforcement: ReinforcementEstimate) -> float:
+    A = floor_area(inp)
+    n_total_levels = inp.n_story + inp.n_basement
+    perimeter = building_perimeter(inp)
 
-def evaluate_design(
-    inp: BuildingInput,
-    base_cores: List[ZoneCoreResult],
-    base_cols: List[ZoneColumnResult],
-    slab_t: float,
-    beam_b: float,
-    beam_h: float,
-    M_total: float,
-    T_target: float,
-    T_limit: float,
-    W_total: float,
-    lambda_core: float,
-    lambda_col: float,
-):
-    zone_cores = scale_core_results(inp, base_cores, lambda_core)
-    zone_cols = scale_column_results(inp, base_cols, lambda_col)
+    imposed = (inp.DL + inp.LL + inp.slab_finish_allowance) * A * inp.n_story
+    imposed += 1.10 * (inp.DL + inp.LL + inp.slab_finish_allowance) * A * inp.n_basement
+    facade = inp.facade_line_load * perimeter * inp.n_story
 
-    K_core = weighted_core_stiffness(inp, zone_cores)
-    K_cols = weighted_column_stiffness(inp, zone_cols)
-    K_est = K_core + K_cols
-    T_est = 2.0 * pi * sqrt(M_total / K_est)
-    drift = preliminary_lateral_force_N(inp, W_total) / K_est
-    drift_ratio = drift / total_height(inp)
-    K_req = required_stiffness(M_total, T_target)
-    reinforcement = estimate_reinforcement(inp, zone_cores, zone_cols, slab_t, beam_b, beam_h)
-
-    weight_proxy = (
+    concrete_vol = (
         reinforcement.wall_concrete_volume_m3
         + reinforcement.column_concrete_volume_m3
         + reinforcement.beam_concrete_volume_m3
         + reinforcement.slab_concrete_volume_m3
-        + reinforcement.total_steel_kg / 1000.0
     )
+    concrete_weight = concrete_vol * CONCRETE_UNIT_WEIGHT_KN_M3
+    steel_weight = reinforcement.total_steel_kg * G / 1000.0
 
-    period_error = (T_est - T_target) / max(T_target, 1e-9)
-    drift_util = drift_ratio / max(inp.drift_limit_ratio, 1e-9)
-    stiffness_gap = (K_est - K_req) / max(K_req, 1e-9)
-
-    objective = (
-        1.0 * weight_proxy
-        + 4000.0 * period_error**2
-        + 150.0 * max(0.0, drift_util - 1.0) ** 2
-        + 100.0 * max(0.0, T_est - T_limit) ** 2
-    )
-
-    return {
-        "zone_cores": zone_cores,
-        "zone_cols": zone_cols,
-        "K_core": K_core,
-        "K_cols": K_cols,
-        "K_est": K_est,
-        "K_req": K_req,
-        "T_est": T_est,
-        "drift": drift,
-        "drift_ratio": drift_ratio,
-        "reinforcement": reinforcement,
-        "objective": objective,
-        "weight_proxy": weight_proxy,
-        "period_error": period_error,
-        "stiffness_gap": stiffness_gap,
-        "period_ok": T_est <= T_limit,
-    }
+    total = (imposed + facade + concrete_weight + steel_weight) * inp.seismic_mass_factor
+    return total
 
 
-def optimize_design(
-    inp: BuildingInput,
-    base_cores: List[ZoneCoreResult],
-    base_cols: List[ZoneColumnResult],
-    slab_t: float,
-    beam_b: float,
-    beam_h: float,
-    M_total: float,
-    T_target: float,
-    T_limit: float,
-    W_total: float,
-) -> tuple[OptimizationResult, dict]:
-    def evfun(x):
-        return evaluate_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_total, T_target, T_limit, W_total, x[0], x[1])
-
-    def obj(x):
-        return evfun(x)["objective"]
-
-    def c_drift(x):
-        ev = evfun(x)
-        return inp.drift_limit_ratio - ev["drift_ratio"]
-
-    def c_period_limit(x):
-        ev = evfun(x)
-        return T_limit - ev["T_est"]
-
-    def c_wall_slenderness(x):
-        ev = evfun(x)
-        return min(inp.max_story_wall_slenderness - z.story_slenderness for z in ev["zone_cores"])
-
-    bounds = [(0.45, 1.80), (0.45, 1.80)]
-    x0 = np.array([1.0, 1.0])
-    constraints = [
-        {"type": "ineq", "fun": c_drift},
-        {"type": "ineq", "fun": c_period_limit},
-        {"type": "ineq", "fun": c_wall_slenderness},
-    ]
-
-    res = opt.minimize(
-        obj,
-        x0,
-        method="SLSQP",
-        bounds=bounds,
-        constraints=constraints,
-        options={"maxiter": 120, "ftol": 1e-8},
-    )
-
-    if not res.success:
-        x_best = x0
-        message = f"Optimizer fallback used: {res.message}"
-        success = False
-        nit = int(getattr(res, "nit", 0))
-    else:
-        x_best = res.x
-        message = str(res.message)
-        success = True
-        nit = int(getattr(res, "nit", 0))
-
-    ev = evfun([float(x_best[0]), float(x_best[1])])
-    opt_result = OptimizationResult(
-        lambda_core=float(x_best[0]),
-        lambda_col=float(x_best[1]),
-        objective_value=float(ev["objective"]),
-        success=success,
-        message=message,
-        n_iterations=nit,
-    )
-    return opt_result, ev
-
-
-# ----------------------------- MDOF + MASS PARTICIPATION -----------------------------
 def build_story_masses(inp: BuildingInput, total_weight_kN_value: float) -> List[float]:
     if inp.n_story <= 0:
         return []
@@ -767,7 +621,8 @@ def build_story_stiffnesses(inp: BuildingInput, K_total: float) -> List[float]:
     raw = []
     for i in range(n):
         r = i / max(n - 1, 1)
-        raw.append(1.35 - 0.55 * r)
+        factor = 1.35 - 0.55 * r
+        raw.append(factor)
     inv_sum = sum(1.0 / a for a in raw)
     c = K_total * inv_sum
     return [c * a for a in raw]
@@ -793,14 +648,15 @@ def solve_mdof_modes(inp: BuildingInput, total_weight_kN_value: float, K_total: 
     masses = build_story_masses(inp, total_weight_kN_value)
     k_stories = build_story_stiffnesses(inp, K_total)
     M, K = assemble_m_k_matrices(masses, k_stories)
-
     A = np.linalg.inv(M) @ K
     eigvals, eigvecs = np.linalg.eig(A)
+
     eigvals = np.real(eigvals)
     eigvecs = np.real(eigvecs)
     pos = eigvals > 1e-12
     eigvals = eigvals[pos]
     eigvecs = eigvecs[:, pos]
+
     order = np.argsort(eigvals)
     eigvals = eigvals[order]
     eigvecs = eigvecs[:, order]
@@ -810,18 +666,21 @@ def solve_mdof_modes(inp: BuildingInput, total_weight_kN_value: float, K_total: 
     freqs = [w / (2.0 * pi) for w in omegas[:n_modes]]
 
     ones = np.ones((len(masses), 1))
-    total_mass = float(ones.T @ M @ ones)
+    modal_participation_factors = []
+    effective_modal_masses = []
+    effective_mass_ratios = []
+    cumulative = []
+    cum = 0.0
+    total_mass = float(np.sum(np.diag(M)))
 
     mode_shapes = []
-    gammas = []
-    eff_masses = []
-    ratios = []
-
     for i in range(min(n_modes, eigvecs.shape[1])):
         phi = eigvecs[:, i].reshape(-1, 1)
-        gamma = float((phi.T @ M @ ones) / (phi.T @ M @ phi))
-        m_eff = float((gamma ** 2) * (phi.T @ M @ phi))
-        ratio = m_eff / total_mass if total_mass > 0 else 0.0
+        denom = float(phi.T @ M @ phi)
+        gamma = float((phi.T @ M @ ones) / denom)
+        meff = gamma**2 * denom
+        ratio = meff / total_mass
+        cum += ratio
 
         phi_plot = phi.flatten().copy()
         if abs(phi_plot[-1]) > 1e-12:
@@ -829,12 +688,11 @@ def solve_mdof_modes(inp: BuildingInput, total_weight_kN_value: float, K_total: 
         if phi_plot[-1] < 0:
             phi_plot = -phi_plot
 
+        modal_participation_factors.append(gamma)
+        effective_modal_masses.append(meff)
+        effective_mass_ratios.append(ratio)
+        cumulative.append(cum)
         mode_shapes.append(phi_plot.tolist())
-        gammas.append(gamma)
-        eff_masses.append(m_eff)
-        ratios.append(ratio)
-
-    cumulative = list(np.cumsum(ratios))
 
     return ModalResult(
         n_dof=len(masses),
@@ -843,116 +701,190 @@ def solve_mdof_modes(inp: BuildingInput, total_weight_kN_value: float, K_total: 
         mode_shapes=mode_shapes,
         story_masses_kg=masses,
         story_stiffness_N_per_m=k_stories,
-        modal_participation_factors=gammas,
-        effective_modal_masses_kg=eff_masses,
-        effective_mass_ratios=ratios,
+        modal_participation_factors=modal_participation_factors,
+        effective_modal_masses_kg=effective_modal_masses,
+        effective_mass_ratios=effective_mass_ratios,
         cumulative_effective_mass_ratios=cumulative,
     )
 
 
-# ----------------------------- MAIN DESIGN -----------------------------
-
-def run_design(inp: BuildingInput) -> DesignResult:
+def evaluate_design(inp: BuildingInput, lambda_core: float, lambda_col: float):
     H = total_height(inp)
     A = floor_area(inp)
     zones = define_three_zones(inp.n_story)
     slab_t = slab_thickness_prelim(inp)
     beam_b, beam_h = beam_size_prelim(inp)
-    W_total = total_weight_kN(inp, slab_t)
-    M_total = W_total * 1000.0 / G
 
-    T_ref = code_type_period(H, inp.Ct, inp.x_period)
-    T_target = T_ref
-    T_limit = inp.period_limit_factor * T_ref
+    zone_cores = design_core_by_zone(inp, zones, lambda_core=lambda_core)
+    zone_cols = estimate_zone_column_sizes(inp, zones, slab_t, lambda_col=lambda_col)
 
-    base_cores = design_core_by_zone(inp, zones)
-    base_cols = estimate_zone_column_sizes(inp, zones, slab_t)
+    K_core = weighted_core_stiffness(inp, zone_cores)
+    K_cols = weighted_column_stiffness(inp, zone_cols)
+    K_est = K_core + K_cols
 
-    opt_result, ev = optimize_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_total, T_target, T_limit, W_total)
-    zone_cores = ev["zone_cores"]
-    zone_cols = ev["zone_cols"]
-    K_core = ev["K_core"]
-    K_cols = ev["K_cols"]
-    K_est = ev["K_est"]
-    K_req = ev["K_req"]
-    T_est = ev["T_est"]
-    drift_ratio = ev["drift_ratio"]
-    top_drift = ev["drift"]
-    reinforcement = ev["reinforcement"]
-    period_ok = ev["period_ok"]
-    period_error = ev["period_error"]
+    reinforcement = estimate_reinforcement(inp, zone_cores, zone_cols, slab_t, beam_b, beam_h)
+    W_total = total_weight_kN_coupled(inp, slab_t, reinforcement)
 
     modal = solve_mdof_modes(inp, W_total, K_est, n_modes=5)
-    first_mode_mass = modal.effective_modal_masses_kg[0] if modal.effective_modal_masses_kg else 0.0
+    T_est = modal.periods_s[0]
+    M_eff = modal.effective_modal_masses_kg[0]
+
+    T_ref = reference_period(inp)
+    T_target = T_ref
+    T_limit = inp.period_limit_factor * T_ref
+    K_req = 4.0 * pi**2 * M_eff / (T_target**2)
+
+    top_drift = preliminary_lateral_force_N(inp, W_total) / K_est
+    drift_ratio = top_drift / H
+
+    return {
+        "H": H,
+        "A": A,
+        "slab_t": slab_t,
+        "beam_b": beam_b,
+        "beam_h": beam_h,
+        "zone_cores": zone_cores,
+        "zone_cols": zone_cols,
+        "K_core": K_core,
+        "K_cols": K_cols,
+        "K_est": K_est,
+        "reinforcement": reinforcement,
+        "W_total": W_total,
+        "modal": modal,
+        "T_est": T_est,
+        "M_eff": M_eff,
+        "T_ref": T_ref,
+        "T_target": T_target,
+        "T_limit": T_limit,
+        "K_req": K_req,
+        "top_drift": top_drift,
+        "drift_ratio": drift_ratio,
+    }
+
+
+def optimize_sections(inp: BuildingInput):
+    baseline = evaluate_design(inp, 1.0, 1.0)
+    W_ref = baseline["W_total"]
+    T_target = baseline["T_target"]
+    drift_allow = inp.drift_limit_ratio
+
+    def objective(x):
+        lam_core, lam_col = x
+        ev = evaluate_design(inp, lam_core, lam_col)
+        period_error = (ev["T_est"] - T_target) / T_target
+        weight_ratio = ev["W_total"] / W_ref
+        # target closeness dominates, weight is secondary
+        return 100.0 * period_error**2 + 0.08 * weight_ratio
+
+    constraints = [
+        {"type": "ineq", "fun": lambda x: inp.period_limit_factor * reference_period(inp) - evaluate_design(inp, x[0], x[1])["T_est"]},
+        {"type": "ineq", "fun": lambda x: drift_allow - evaluate_design(inp, x[0], x[1])["drift_ratio"]},
+    ]
+
+    bounds = [(0.65, 1.60), (0.65, 1.60)]
+    result = opt.minimize(
+        objective,
+        x0=np.array([1.0, 1.0]),
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 60, "ftol": 1e-5, "disp": False},
+    )
+
+    lam_core, lam_col = result.x
+    final_eval = evaluate_design(inp, float(lam_core), float(lam_col))
+    opt_res = OptimizationResult(
+        lambda_core=float(lam_core),
+        lambda_col=float(lam_col),
+        objective_value=float(result.fun),
+        success=bool(result.success),
+        message=str(result.message),
+        n_iterations=int(getattr(result, "nit", 0)),
+    )
+    return final_eval, opt_res
+
+
+def preliminary_lateral_force_N(inp: BuildingInput, W_total_kN: float) -> float:
+    return inp.prelim_lateral_force_coeff * W_total_kN * 1000.0
+
+
+def run_design(inp: BuildingInput) -> DesignResult:
+    ev, opt_res = optimize_sections(inp)
+
+    period_error_ratio = (ev["T_est"] - ev["T_target"]) / ev["T_target"]
+    period_ok = ev["T_est"] <= ev["T_limit"]
 
     messages = []
-    messages.append(f"Optimization status: {'SUCCESS' if opt_result.success else 'FALLBACK'} | {opt_result.message}")
-    messages.append(f"Optimized lambda_core = {opt_result.lambda_core:.3f}")
-    messages.append(f"Optimized lambda_col  = {opt_result.lambda_col:.3f}")
-    messages.append(f"Reference period computed as T_ref = Ct * H^x = {T_ref:.3f} s.")
-    messages.append(f"Design target is set automatically equal to the reference period: {T_target:.3f} s.")
-    messages.append(f"User-defined upper limit factor = {inp.period_limit_factor:.3f}, so T_limit = {T_limit:.3f} s.")
-    messages.append(f"Dynamic period error relative to target = {100.0*period_error:.2f}%.")
-    if K_est < K_req:
-        messages.append("Estimated total stiffness is lower than the stiffness corresponding to the target period.")
-    if drift_ratio > inp.drift_limit_ratio:
-        messages.append("Estimated top drift exceeds selected preliminary drift limit.")
-    if period_ok:
-        messages.append(f"Upper-limit period check OK: T_est = {T_est:.3f} s <= T_limit = {T_limit:.3f} s.")
+    if opt_res.success:
+        messages.append("Optimization converged successfully.")
     else:
-        messages.append(f"Upper-limit period check NOT OK: T_est = {T_est:.3f} s > T_limit = {T_limit:.3f} s.")
-    for zc in zone_cores:
+        messages.append(f"Optimization warning: {opt_res.message}")
+    messages.append(f"Reference period = {ev['T_ref']:.3f} s")
+    messages.append(f"Design target period = {ev['T_target']:.3f} s")
+    messages.append(f"Estimated dynamic period = {ev['T_est']:.3f} s")
+    messages.append(f"Upper limit period = {ev['T_limit']:.3f} s")
+    messages.append(f"Period error = {100.0 * period_error_ratio:+.2f}%")
+    messages.append(f"Core scale = {opt_res.lambda_core:.3f}, column scale = {opt_res.lambda_col:.3f}")
+
+    if period_ok:
+        messages.append("Upper period limit check: OK")
+    else:
+        messages.append("Upper period limit check: NOT OK")
+    if ev["drift_ratio"] <= inp.drift_limit_ratio:
+        messages.append("Drift check: OK")
+    else:
+        messages.append("Drift check: NOT OK")
+
+    for zc in ev["zone_cores"]:
         if zc.story_slenderness > inp.max_story_wall_slenderness:
-            messages.append(f"{zc.zone.name}: wall slenderness h/t exceeds selected preliminary limit.")
-    messages.append("Modal mass participation ratios are computed directly from the eigenvectors and mass matrix.")
+            messages.append(f"{zc.zone.name}: wall slenderness exceeds limit.")
 
     assessment = (
-        "System appears preliminarily adequate and optimized."
-        if (abs(period_error) <= 0.05 and drift_ratio <= inp.drift_limit_ratio and period_ok)
-        else "System is not yet fully aligned with the target period / drift / limit checks; revise constraints or sizing assumptions."
+        "System appears preliminarily adequate."
+        if period_ok and ev["drift_ratio"] <= inp.drift_limit_ratio and abs(period_error_ratio) <= 0.05
+        else "System is not yet satisfactory; review geometry, stiffness, and loading assumptions."
     )
 
     return DesignResult(
-        H_m=H,
-        floor_area_m2=A,
-        total_weight_kN=W_total,
-        effective_modal_mass_kg=first_mode_mass,
-        T_code_s=T_ref,
-        T_limit_s=T_limit,
-        period_ok=period_ok,
-        T_target_s=T_target,
-        T_est_s=T_est,
-        K_required_N_per_m=K_req,
-        K_core_N_per_m=K_core,
-        K_columns_N_per_m=K_cols,
-        K_estimated_N_per_m=K_est,
-        top_drift_m=top_drift,
-        drift_ratio=drift_ratio,
-        zone_core_results=zone_cores,
-        zone_column_results=zone_cols,
-        slab_thickness_m=slab_t,
-        beam_width_m=beam_b,
-        beam_depth_m=beam_h,
-        reinforcement=reinforcement,
+        H_m=ev["H"],
+        floor_area_m2=ev["A"],
+        total_weight_kN=ev["W_total"],
+        effective_modal_mass_kg=ev["M_eff"],
+        reference_period_s=ev["T_ref"],
+        design_target_period_s=ev["T_target"],
+        upper_limit_period_s=ev["T_limit"],
+        estimated_dynamic_period_s=ev["T_est"],
+        period_error_ratio=period_error_ratio,
+        period_within_limit=period_ok,
+        K_required_N_per_m=ev["K_req"],
+        K_core_N_per_m=ev["K_core"],
+        K_columns_N_per_m=ev["K_cols"],
+        K_estimated_N_per_m=ev["K_est"],
+        top_drift_m=ev["top_drift"],
+        drift_ratio=ev["drift_ratio"],
+        zone_core_results=ev["zone_cores"],
+        zone_column_results=ev["zone_cols"],
+        slab_thickness_m=ev["slab_t"],
+        beam_width_m=ev["beam_b"],
+        beam_depth_m=ev["beam_h"],
+        reinforcement=ev["reinforcement"],
+        optimization=opt_res,
         system_assessment=assessment,
-        optimization=opt_result,
         messages=messages,
-        modal_result=modal,
+        modal_result=ev["modal"],
     )
 
 
 def build_report(result: DesignResult) -> str:
-    period_error_pct = 100.0 * (result.T_est_s - result.T_target_s) / max(result.T_target_s, 1e-9)
-
     lines = []
     lines.append("GLOBAL RESPONSE")
     lines.append("-" * 74)
-    lines.append(f"Reference period               = {result.T_code_s:.3f} s")
-    lines.append(f"Design target period           = {result.T_target_s:.3f} s")
-    lines.append(f"Estimated dynamic period       = {result.T_est_s:.3f} s")
-    lines.append(f"Allowed upper limit            = {result.T_limit_s:.3f} s")
-    lines.append(f"Period error                   = {period_error_pct:.2f} %")
-    lines.append(f"Upper-limit check             = {'OK' if result.period_ok else 'NOT OK'}")
+    lines.append(f"Reference period               = {result.reference_period_s:.3f} s")
+    lines.append(f"Design target period           = {result.design_target_period_s:.3f} s")
+    lines.append(f"Estimated dynamic period       = {result.estimated_dynamic_period_s:.3f} s")
+    lines.append(f"Upper limit period             = {result.upper_limit_period_s:.3f} s")
+    lines.append(f"Period error                   = {100.0 * result.period_error_ratio:+.2f} %")
+    lines.append(f"Upper limit check              = {'OK' if result.period_within_limit else 'NOT OK'}")
     lines.append(f"Required stiffness             = {result.K_required_N_per_m:,.3e} N/m")
     lines.append(f"Core stiffness                 = {result.K_core_N_per_m:,.3e} N/m")
     lines.append(f"Column stiffness contribution  = {result.K_columns_N_per_m:,.3e} N/m")
@@ -960,20 +892,20 @@ def build_report(result: DesignResult) -> str:
     lines.append(f"Estimated top drift            = {result.top_drift_m:.3f} m")
     lines.append(f"Estimated drift ratio          = {result.drift_ratio:.5f}")
     lines.append(f"Total structural weight        = {result.total_weight_kN:,.0f} kN")
-    lines.append(f"First-mode effective mass      = {result.effective_modal_mass_kg:,.0f} kg")
+    lines.append(f"Effective modal mass (Mode 1)  = {result.effective_modal_mass_kg:,.0f} kg")
     lines.append(f"Beam size (b x h)              = {result.beam_width_m:.2f} x {result.beam_depth_m:.2f} m")
     lines.append(f"Slab thickness                 = {result.slab_thickness_m:.2f} m")
     lines.append("")
     lines.append("OPTIMIZATION")
     lines.append("-" * 74)
-    lines.append(f"lambda_core                    = {result.optimization.lambda_core:.3f}")
-    lines.append(f"lambda_col                     = {result.optimization.lambda_col:.3f}")
-    lines.append(f"objective                      = {result.optimization.objective_value:.3f}")
-    lines.append(f"success                        = {result.optimization.success}")
-    lines.append(f"message                        = {result.optimization.message}")
-    lines.append(f"iterations                     = {result.optimization.n_iterations}")
+    lines.append(f"Core scale factor              = {result.optimization.lambda_core:.3f}")
+    lines.append(f"Column scale factor            = {result.optimization.lambda_col:.3f}")
+    lines.append(f"Objective value                = {result.optimization.objective_value:.6f}")
+    lines.append(f"Success                        = {result.optimization.success}")
+    lines.append(f"Iterations                     = {result.optimization.n_iterations}")
+    lines.append(f"Message                        = {result.optimization.message}")
     lines.append("")
-    lines.append("MODAL MASS PARTICIPATION")
+    lines.append("MASS PARTICIPATION")
     lines.append("-" * 74)
     if result.modal_result is not None:
         mr = result.modal_result
@@ -981,21 +913,18 @@ def build_report(result: DesignResult) -> str:
             lines.append(
                 f"Mode {i+1}: T={mr.periods_s[i]:.4f} s | f={mr.frequencies_hz[i]:.4f} Hz | "
                 f"Gamma={mr.modal_participation_factors[i]:.4f} | "
-                f"Meff ratio={100*mr.effective_mass_ratios[i]:.2f}% | "
-                f"Cumulative={100*mr.cumulative_effective_mass_ratios[i]:.2f}%"
+                f"Mass ratio={100.0 * mr.effective_mass_ratios[i]:.2f}% | "
+                f"Cumulative={100.0 * mr.cumulative_effective_mass_ratios[i]:.2f}%"
             )
-    lines.append("")
-    lines.append("SYSTEM ASSESSMENT")
-    lines.append("-" * 74)
-    lines.append(result.system_assessment)
     lines.append("")
     lines.append("MESSAGES")
     lines.append("-" * 74)
-    for m in result.messages:
-        lines.append(f"- {m}")
+    for msg in result.messages:
+        lines.append(f"- {msg}")
     return "\n".join(lines)
 
-# ----------------------------- DISPLAY -----------------------------
+
+# ----------------------------- DISPLAY HELPERS -----------------------------
 def plot_mode_shapes(result: DesignResult):
     mr = result.modal_result
     if mr is None:
@@ -1023,15 +952,12 @@ def plot_mode_shapes(result: DesignResult):
         ax.set_xlim(-1.1, 1.1)
         ax.set_ylim(0.0, H)
         if m == 0:
-            ax.set_ylabel("Height (m)", fontsize=10)
+            ax.set_ylabel("Height (m)")
             ax.set_yticks([0.0, H])
             ax.set_yticklabels([f"Base\n0.0", f"Roof\n{H:.1f}"])
         else:
             ax.set_yticks([])
         ax.set_xticks([])
-        for spine in ax.spines.values():
-            spine.set_color("#999999")
-            spine.set_linewidth(1.0)
     fig.suptitle("First 5 Mode Shapes (MDOF)", fontsize=15, fontweight="bold")
     fig.tight_layout()
     return fig
@@ -1042,122 +968,187 @@ def _draw_rect(ax, x, y, w, h, color, fill=True, alpha=1.0, lw=1.0, ls="-", ec=N
     ax.add_patch(rect)
 
 
-def _draw_square_plan(ax, inp: BuildingInput, core: ZoneCoreResult, cols: ZoneColumnResult, result: DesignResult):
-    ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0], color="black", linewidth=1.5)
-    for i in range(inp.n_bays_x + 1):
-        gx = i * inp.bay_x
-        ax.plot([gx, gx], [0, inp.plan_y], color="#d9d9d9", linewidth=0.8)
-    for j in range(inp.n_bays_y + 1):
-        gy = j * inp.bay_y
-        ax.plot([0, inp.plan_x], [gy, gy], color="#d9d9d9", linewidth=0.8)
-    for i in range(inp.n_bays_x + 1):
-        for j in range(inp.n_bays_y + 1):
-            px = i * inp.bay_x
-            py = j * inp.bay_y
-            at_lr = i == 0 or i == inp.n_bays_x
-            at_bt = j == 0 or j == inp.n_bays_y
-            if at_lr and at_bt:
-                dx, dy, color = cols.corner_column_x_m, cols.corner_column_y_m, CORNER_COLOR
-            elif at_lr or at_bt:
-                dx, dy, color = cols.perimeter_column_x_m, cols.perimeter_column_y_m, PERIM_COLOR
-            else:
-                dx, dy, color = cols.interior_column_x_m, cols.interior_column_y_m, INTERIOR_COLOR
-            _draw_rect(ax, px - dx / 2, py - dy / 2, dx, dy, color, fill=True, alpha=0.95, lw=0.5)
-    cx0 = (inp.plan_x - core.core_outer_x) / 2
-    cy0 = (inp.plan_y - core.core_outer_y) / 2
-    ix0 = (inp.plan_x - core.core_opening_x) / 2
-    iy0 = (inp.plan_y - core.core_opening_y) / 2
-    _draw_rect(ax, cx0, cy0, core.core_outer_x, core.core_outer_y, CORE_COLOR, fill=False, lw=2.5)
-    _draw_rect(ax, ix0, iy0, core.core_opening_x, core.core_opening_y, "#666666", fill=False, lw=1.3, ls="--")
-    ax.set_title(f"{core.zone.name} - Square plan", fontsize=14, fontweight="bold")
-    ax.set_xlim(-8, inp.plan_x + 8)
-    ax.set_ylim(inp.plan_y + 8, -8)
-    ax.set_aspect("equal")
-    ax.axis("off")
-
-
-def _draw_triangle_plan(ax, inp: BuildingInput, core: ZoneCoreResult, cols: ZoneColumnResult):
-    pts = np.array([[0, inp.plan_y], [inp.plan_x / 2, 0], [inp.plan_x, inp.plan_y], [0, inp.plan_y]])
-    ax.plot(pts[:, 0], pts[:, 1], color="black", linewidth=1.5)
-    corner_pts = [(0, inp.plan_y), (inp.plan_x / 2, 0), (inp.plan_x, inp.plan_y)]
-    for x, y in corner_pts:
-        _draw_rect(ax, x - cols.corner_column_x_m / 2, y - cols.corner_column_y_m / 2, cols.corner_column_x_m, cols.corner_column_y_m, CORNER_COLOR, fill=True, alpha=0.95)
-    cx0 = (inp.plan_x - core.core_outer_x) / 2
-    cy0 = inp.plan_y * 0.42
-    _draw_rect(ax, cx0, cy0, core.core_outer_x, core.core_outer_y, CORE_COLOR, fill=False, lw=2.5)
-    ax.set_title(f"{core.zone.name} - Triangular plan", fontsize=14, fontweight="bold")
-    ax.set_xlim(-8, inp.plan_x + 8)
-    ax.set_ylim(inp.plan_y + 8, -8)
-    ax.set_aspect("equal")
-    ax.axis("off")
-
-
 def plot_plan(inp: BuildingInput, result: DesignResult, zone_name: str):
     core = next(z for z in result.zone_core_results if z.zone.name == zone_name)
     cols = next(z for z in result.zone_column_results if z.zone.name == zone_name)
-    fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(13, 7))
     if inp.plan_shape == "triangle":
-        _draw_triangle_plan(ax, inp, core, cols)
+        pts = np.array([[0, inp.plan_y], [inp.plan_x / 2, 0], [inp.plan_x, inp.plan_y], [0, inp.plan_y]])
+        ax.plot(pts[:, 0], pts[:, 1], color="black", linewidth=1.5)
     else:
-        _draw_square_plan(ax, inp, core, cols, result)
+        ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0], color="black", linewidth=1.5)
+        for i in range(inp.n_bays_x + 1):
+            gx = i * inp.bay_x
+            ax.plot([gx, gx], [0, inp.plan_y], color="#d9d9d9", linewidth=0.8)
+        for j in range(inp.n_bays_y + 1):
+            gy = j * inp.bay_y
+            ax.plot([0, inp.plan_x], [gy, gy], color="#d9d9d9", linewidth=0.8)
+        for i in range(inp.n_bays_x + 1):
+            for j in range(inp.n_bays_y + 1):
+                px = i * inp.bay_x
+                py = j * inp.bay_y
+                at_lr = i == 0 or i == inp.n_bays_x
+                at_bt = j == 0 or j == inp.n_bays_y
+                if at_lr and at_bt:
+                    dx, dy, color = cols.corner_column_x_m, cols.corner_column_y_m, CORNER_COLOR
+                elif at_lr or at_bt:
+                    dx, dy, color = cols.perimeter_column_x_m, cols.perimeter_column_y_m, PERIM_COLOR
+                else:
+                    dx, dy, color = cols.interior_column_x_m, cols.interior_column_y_m, INTERIOR_COLOR
+                _draw_rect(ax, px - dx / 2, py - dy / 2, dx, dy, color, fill=True, alpha=0.95, lw=0.5)
+
+    cx0 = (inp.plan_x - core.core_outer_x) / 2
+    cy0 = (inp.plan_y - core.core_outer_y) / 2 if inp.plan_shape == "square" else inp.plan_y * 0.42
+    _draw_rect(ax, cx0, cy0, core.core_outer_x, core.core_outer_y, CORE_COLOR, fill=False, lw=2.5)
+    ix0 = (inp.plan_x - core.core_opening_x) / 2
+    iy0 = (inp.plan_y - core.core_opening_y) / 2 if inp.plan_shape == "square" else cy0 + (core.core_outer_y - core.core_opening_y) / 2
+    _draw_rect(ax, ix0, iy0, core.core_opening_x, core.core_opening_y, "#666666", fill=False, lw=1.3, ls="--")
+
+    ax.set_title(f"{zone_name} - Plan View", fontsize=14, fontweight="bold")
+    ax.set_xlim(-8, inp.plan_x + 25)
+    ax.set_ylim(inp.plan_y + 8, -12)
+    ax.set_aspect("equal")
+    ax.axis("off")
     return fig
 
 
-def streamlit_input_panel() -> BuildingInput:
+def participation_table(result: DesignResult):
+    mr = result.modal_result
+    if mr is None:
+        return []
+    rows = []
+    for i in range(len(mr.periods_s)):
+        rows.append({
+            "Mode": i + 1,
+            "Period (s)": mr.periods_s[i],
+            "Freq (Hz)": mr.frequencies_hz[i],
+            "Gamma": mr.modal_participation_factors[i],
+            "Eff. mass ratio (%)": 100.0 * mr.effective_mass_ratios[i],
+            "Cum. mass ratio (%)": 100.0 * mr.cumulative_effective_mass_ratios[i],
+        })
+    return rows
+
+
+def download_report_bytes(report_text: str):
+    return report_text.encode("utf-8")
+
+
+# ----------------------------- INPUT PANEL -----------------------------
+def input_panel() -> BuildingInput:
     st.markdown("### Plan Shape")
     plan_shape = st.radio(" ", ["square", "triangle"], horizontal=True, label_visibility="collapsed")
+
     st.markdown("### Geometry")
     c1, c2 = st.columns(2)
     with c1:
-        n_story = st.number_input("Above-grade stories", 1, 120, 50)
-        n_basement = st.number_input("Basement stories", 0, 20, 10)
-        plan_x = st.number_input("Plan X (m)", 10.0, 300.0, 80.0)
-        n_bays_x = st.number_input("Bays in X", 1, 30, 8)
-        bay_x = st.number_input("Bay X (m)", 2.0, 20.0, 10.0)
+        n_story = st.number_input("Above-grade stories", min_value=1, max_value=120, value=50, step=1)
+        basement_height = st.number_input("Basement height (m)", min_value=2.5, max_value=6.0, value=3.0)
+        plan_x = st.number_input("Plan X (m)", min_value=10.0, max_value=300.0, value=80.0)
+        n_bays_x = st.number_input("Bays in X", min_value=1, max_value=30, value=8, step=1)
+        bay_x = st.number_input("Bay X (m)", min_value=2.0, max_value=20.0, value=10.0)
+        stair_count = st.number_input("Stairs", min_value=0, max_value=20, value=2, step=1)
     with c2:
-        story_height = st.number_input("Story height (m)", 2.5, 6.0, 3.2)
-        basement_height = st.number_input("Basement height (m)", 2.5, 6.0, 3.0)
-        plan_y = st.number_input("Plan Y (m)", 10.0, 300.0, 80.0)
-        n_bays_y = st.number_input("Bays in Y", 1, 30, 8)
-        bay_y = st.number_input("Bay Y (m)", 2.0, 20.0, 10.0)
-    st.markdown("### Loads / Materials")
+        n_basement = st.number_input("Basement stories", min_value=0, max_value=20, value=10, step=1)
+        story_height = st.number_input("Story height (m)", min_value=2.5, max_value=6.0, value=3.2)
+        plan_y = st.number_input("Plan Y (m)", min_value=10.0, max_value=300.0, value=80.0)
+        n_bays_y = st.number_input("Bays in Y", min_value=1, max_value=30, value=8, step=1)
+        bay_y = st.number_input("Bay Y (m)", min_value=2.0, max_value=20.0, value=10.0)
+        elevator_count = st.number_input("Elevators", min_value=0, max_value=30, value=4, step=1)
+
+    st.markdown("### Loads and Materials")
     c3, c4 = st.columns(2)
     with c3:
-        DL = st.number_input("DL (kN/mÂ²)", 0.0, 20.0, 6.5)
-        slab_finish_allowance = st.number_input("Slab/fit-out allowance", 0.0, 10.0, 1.5)
-        fck = st.number_input("fck (MPa)", 20.0, 100.0, 60.0)
-        wall_cracked_factor = st.number_input("Wall cracked factor", 0.1, 1.0, 0.7)
-        period_limit_factor = st.number_input("Upper period limit factor", 1.0, 3.0, 1.40)
+        elevator_area_each = st.number_input("Elevator area each (mÂ²)", min_value=0.0, max_value=20.0, value=3.5)
+        service_area = st.number_input("Service area (mÂ²)", min_value=0.0, max_value=200.0, value=35.0)
+        fck = st.number_input("fck (MPa)", min_value=20.0, max_value=100.0, value=70.0)
+        fy = st.number_input("fy (MPa)", min_value=200.0, max_value=700.0, value=420.0)
+        DL = st.number_input("DL (kN/mÂ²)", min_value=0.0, max_value=20.0, value=3.0)
+        slab_finish_allowance = st.number_input("Slab/fit-out allowance", min_value=0.0, max_value=10.0, value=1.5)
+        wall_cracked_factor = st.number_input("Wall cracked factor", min_value=0.1, max_value=1.0, value=0.7)
+        basement_retaining_wall_thickness = st.number_input("Basement retaining wall t (m)", min_value=0.1, max_value=2.0, value=0.5)
     with c4:
-        LL = st.number_input("LL (kN/mÂ²)", 0.0, 20.0, 2.5)
-        facade_line_load = st.number_input("Facade line load (kN/m)", 0.0, 50.0, 14.0)
-        Ec = st.number_input("Ec (MPa)", 20000.0, 60000.0, 36000.0)
-        column_cracked_factor = st.number_input("Column cracked factor", 0.1, 1.0, 0.7)
+        stair_area_each = st.number_input("Stair area each (mÂ²)", min_value=0.0, max_value=50.0, value=20.0)
+        corridor_factor = st.number_input("Core circulation factor", min_value=0.5, max_value=3.0, value=1.4)
+        Ec = st.number_input("Ec (MPa)", min_value=20000.0, max_value=60000.0, value=36000.0)
+        LL = st.number_input("LL (kN/mÂ²)", min_value=0.0, max_value=20.0, value=2.5)
+        facade_line_load = st.number_input("Facade line load (kN/m)", min_value=0.0, max_value=50.0, value=1.0)
+        column_cracked_factor = st.number_input("Column cracked factor", min_value=0.1, max_value=1.0, value=0.7)
+
+    st.markdown("### Dynamic Controls")
+    c5, c6 = st.columns(2)
+    with c5:
+        prelim_lateral_force_coeff = st.number_input("Prelim lateral coeff", min_value=0.001, max_value=0.100, value=0.015)
+        period_limit_factor = st.number_input("Upper period limit factor", min_value=1.0, max_value=3.0, value=1.40)
+        Ct = st.number_input("Ct", min_value=0.001, max_value=0.200, value=0.0488, format="%.4f")
+        x_period = st.number_input("x exponent", min_value=0.1, max_value=1.5, value=0.75)
+        drift_denominator = st.number_input("Drift denominator", min_value=100.0, max_value=2000.0, value=500.0)
+        seismic_mass_factor = st.number_input("Seismic mass factor", min_value=0.1, max_value=2.0, value=1.0)
+    with c6:
+        min_wall_thickness = st.number_input("Min wall thickness (m)", min_value=0.1, max_value=2.0, value=0.3)
+        max_wall_thickness = st.number_input("Max wall thickness (m)", min_value=0.1, max_value=3.0, value=1.2)
+        min_column_dim = st.number_input("Min column dimension (m)", min_value=0.1, max_value=3.0, value=0.7)
+        max_column_dim = st.number_input("Max column dimension (m)", min_value=0.1, max_value=5.0, value=1.8)
+        max_story_wall_slenderness = st.number_input("Max wall slenderness", min_value=1.0, max_value=50.0, value=12.0)
+        perimeter_column_factor = st.number_input("Perimeter column factor", min_value=1.0, max_value=3.0, value=1.1)
+        corner_column_factor = st.number_input("Corner column factor", min_value=1.0, max_value=3.0, value=1.3)
+
     return BuildingInput(
         plan_shape=plan_shape,
-        n_story=int(n_story), n_basement=int(n_basement), story_height=float(story_height), basement_height=float(basement_height),
-        plan_x=float(plan_x), plan_y=float(plan_y), n_bays_x=int(n_bays_x), n_bays_y=int(n_bays_y), bay_x=float(bay_x), bay_y=float(bay_y),
-        DL=float(DL), LL=float(LL), slab_finish_allowance=float(slab_finish_allowance), facade_line_load=float(facade_line_load),
-        fck=float(fck), Ec=float(Ec), wall_cracked_factor=float(wall_cracked_factor), column_cracked_factor=float(column_cracked_factor),
-        period_limit_factor=float(period_limit_factor)
+        n_story=int(n_story),
+        n_basement=int(n_basement),
+        story_height=float(story_height),
+        basement_height=float(basement_height),
+        plan_x=float(plan_x),
+        plan_y=float(plan_y),
+        n_bays_x=int(n_bays_x),
+        n_bays_y=int(n_bays_y),
+        bay_x=float(bay_x),
+        bay_y=float(bay_y),
+        stair_count=int(stair_count),
+        elevator_count=int(elevator_count),
+        elevator_area_each=float(elevator_area_each),
+        stair_area_each=float(stair_area_each),
+        service_area=float(service_area),
+        corridor_factor=float(corridor_factor),
+        fck=float(fck),
+        Ec=float(Ec),
+        fy=float(fy),
+        DL=float(DL),
+        LL=float(LL),
+        slab_finish_allowance=float(slab_finish_allowance),
+        facade_line_load=float(facade_line_load),
+        prelim_lateral_force_coeff=float(prelim_lateral_force_coeff),
+        drift_limit_ratio=1.0 / float(drift_denominator),
+        period_limit_factor=float(period_limit_factor),
+        wall_cracked_factor=float(wall_cracked_factor),
+        column_cracked_factor=float(column_cracked_factor),
+        min_wall_thickness=float(min_wall_thickness),
+        max_wall_thickness=float(max_wall_thickness),
+        min_column_dim=float(min_column_dim),
+        max_column_dim=float(max_column_dim),
+        max_story_wall_slenderness=float(max_story_wall_slenderness),
+        perimeter_column_factor=float(perimeter_column_factor),
+        corner_column_factor=float(corner_column_factor),
+        seismic_mass_factor=float(seismic_mass_factor),
+        Ct=float(Ct),
+        x_period=float(x_period),
+        basement_retaining_wall_thickness=float(basement_retaining_wall_thickness),
     )
 
 
-# ----------------------------- UI -----------------------------
+# ----------------------------- STREAMLIT LAYOUT -----------------------------
 st.markdown(
     """
     <style>
-    .main .block-container {padding-top: 0.8rem; padding-bottom: 0.8rem; max-width: 100%;}
-    .stButton button {width: 100%; font-weight: 700; height: 3rem; border-radius: 10px;}
-    div[data-testid="stMetric"] {background: #f7f9fc; border: 1px solid #e6ebf2; padding: 0.35rem 0.5rem; border-radius: 10px;}
+    .main .block-container {padding-top: 0.7rem; padding-bottom: 0.7rem; max-width: 100%;}
+    .stButton button {width: 100%; font-weight: 700; height: 3rem;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("Tall Building Structural Analysis Framework")
-st.caption(f"Optimized SDOFâMDOF preliminary design tool | Version {APP_VERSION}")
-author_name = st.text_input("Author name shown in report", value=DEFAULT_AUTHOR_NAME)
+st.title("Tall Building Preliminary Structural Analysis")
+st.caption(f"Prepared by {DEFAULT_AUTHOR_NAME} | {APP_VERSION}")
 
 if "result" not in st.session_state:
     st.session_state.result = None
@@ -1169,8 +1160,7 @@ if "view_mode" not in st.session_state:
 left_col, right_col = st.columns([1.0, 2.2], gap="medium")
 
 with left_col:
-    st.markdown("### Input panel")
-    inp = streamlit_input_panel()
+    inp = input_panel()
     b1, b2, b3 = st.columns(3)
     with b1:
         if st.button("ANALYZE"):
@@ -1195,8 +1185,8 @@ with left_col:
         if st.session_state.report:
             st.download_button(
                 "SAVE REPORT",
-                data=st.session_state.report.encode("utf-8"),
-                file_name=f"tall_building_report_{author_name}.txt",
+                data=download_report_bytes(st.session_state.report),
+                file_name="tall_building_report.txt",
                 mime="text/plain",
             )
         else:
@@ -1204,41 +1194,29 @@ with left_col:
 
 with right_col:
     zone_name = st.selectbox("Displayed zone:", ["Lower Zone", "Middle Zone", "Upper Zone"], index=0)
-    if st.session_state.result is None:
-        st.info("Run ANALYZE to optimize sections and display the plan, or SHOW 5 MODES to display modal shapes.")
-    else:
-        r = st.session_state.result
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Code period (s)", f"{r.T_code_s:.3f}")
-        c2.metric("Upper-limit limit (s)", f"{r.T_limit_s:.3f}")
-        c3.metric("Estimated period (s)", f"{r.T_est_s:.3f}")
-        c4.metric("Top drift (m)", f"{r.top_drift_m:.3f}")
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("Design target (s)", f"{r.T_target_s:.3f}")
-        d2.metric("Core scale", f"{r.optimization.lambda_core:.3f}")
-        d3.metric("Column scale", f"{r.optimization.lambda_col:.3f}")
-        d4.metric("Upper-limit check", "OK" if r.period_ok else "NOT OK")
 
-        tab1, tab2, tab3 = st.tabs(["Graphic output", "Mass participation", "Report"])
-        with tab1:
+    if st.session_state.result is None:
+        st.info("Click ANALYZE to display the plan and report, or SHOW 5 MODES to display modal shapes.")
+    else:
+        res = st.session_state.result
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Reference period (s)", f"{res.reference_period_s:.3f}")
+        r2.metric("Design target (s)", f"{res.design_target_period_s:.3f}")
+        r3.metric("Estimated dynamic (s)", f"{res.estimated_dynamic_period_s:.3f}")
+        r4.metric("Upper limit (s)", f"{res.upper_limit_period_s:.3f}")
+
+        r5, r6, r7 = st.columns(3)
+        r5.metric("Period error (%)", f"{100.0 * res.period_error_ratio:+.2f}")
+        r6.metric("Total stiffness (N/m)", f"{res.K_estimated_N_per_m:,.2e}")
+        r7.metric("Top drift (m)", f"{res.top_drift_m:.3f}")
+
+        tabs = st.tabs(["Graphic output", "Mass participation", "Report"])
+        with tabs[0]:
             if st.session_state.view_mode == "modes":
-                st.pyplot(plot_mode_shapes(r), use_container_width=True)
+                st.pyplot(plot_mode_shapes(res), use_container_width=True)
             else:
-                st.pyplot(plot_plan(inp, r, zone_name), use_container_width=True)
-        with tab2:
-            if r.modal_result is not None:
-                rows = []
-                for i in range(len(r.modal_result.periods_s)):
-                    rows.append({
-                        "Mode": i + 1,
-                        "Period (s)": round(r.modal_result.periods_s[i], 4),
-                        "Freq. (Hz)": round(r.modal_result.frequencies_hz[i], 4),
-                        "Gamma": round(r.modal_result.modal_participation_factors[i], 4),
-                        "Eff. mass ratio (%)": round(100 * r.modal_result.effective_mass_ratios[i], 2),
-                        "Cumulative (%)": round(100 * r.modal_result.cumulative_effective_mass_ratios[i], 2),
-                    })
-                st.dataframe(rows, use_container_width=True, hide_index=True)
-            else:
-                st.info("Modal results are not available.")
-        with tab3:
-            st.text_area("", st.session_state.report, height=420, label_visibility="collapsed")
+                st.pyplot(plot_plan(inp, res, zone_name), use_container_width=True)
+        with tabs[1]:
+            st.dataframe(participation_table(res), use_container_width=True)
+        with tabs[2]:
+            st.text_area("", st.session_state.report, height=440, label_visibility="collapsed")
