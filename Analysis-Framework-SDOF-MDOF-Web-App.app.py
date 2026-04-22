@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 AUTHOR_NAME = "Benyamin"
-APP_VERSION = "vFinal-stable"
+APP_VERSION = "vIterative-target"
 
 G = 9.81
 STEEL_DENSITY = 7850.0
@@ -704,19 +704,26 @@ def evaluate_design(inp: BuildingInput, core_scale: float, column_scale: float, 
     }
 
 
-def optimize_scales(inp: BuildingInput, beta: float):
+def optimize_scales(inp: BuildingInput, beta: float, x0: np.ndarray | None = None):
     def objective(x):
         core_scale, col_scale = float(x[0]), float(x[1])
         ev = evaluate_design(inp, core_scale, col_scale, beta)
-        weight_term = ev["W_total"] / 1e6
-        period_term = 200.0 * ev["period_error"]**2
-        drift_term = 50.0 * max(ev["drift_ratio"] / inp.drift_limit_ratio - 1.0, 0.0) ** 2
-        upper_term = 100.0 * max(ev["T_est"] / ev["T_upper"] - 1.0, 0.0) ** 2
-        return weight_term + period_term + drift_term + upper_term
+        # Primary goal: match target period while keeping the lightest feasible system.
+        period_term = 900.0 * ev["period_error"]**2
+        # Strong penalty if estimated period exceeds upper limit.
+        upper_term = 5000.0 * max(ev["T_est"] / ev["T_upper"] - 1.0, 0.0) ** 2
+        # Strong penalty if drift exceeds limit.
+        drift_term = 3500.0 * max(ev["drift_ratio"] / inp.drift_limit_ratio - 1.0, 0.0) ** 2
+        # Weight is secondary; normalized to keep scales numerically balanced.
+        weight_term = 0.20 * (ev["W_total"] / 1e6)
+        # Mild penalty to avoid wildly different core/column scales.
+        balance_term = 2.0 * (core_scale - col_scale) ** 2
+        return period_term + upper_term + drift_term + weight_term + balance_term
 
-    bounds = [(0.70, 1.60), (0.70, 1.60)]
-    x0 = np.array([1.0, 1.0], dtype=float)
-    res = minimize(objective, x0=x0, bounds=bounds, method="L-BFGS-B")
+    bounds = [(0.55, 1.60), (0.55, 1.60)]
+    if x0 is None:
+        x0 = np.array([1.0, 1.0], dtype=float)
+    res = minimize(objective, np.asarray(x0, dtype=float), bounds=bounds, method="L-BFGS-B")
     core_scale, col_scale = float(res.x[0]), float(res.x[1])
     ev = evaluate_design(inp, core_scale, col_scale, beta)
     return res, core_scale, col_scale, ev
@@ -724,7 +731,30 @@ def optimize_scales(inp: BuildingInput, beta: float):
 
 def run_design(inp: BuildingInput) -> DesignResult:
     beta = inp.target_position_factor
-    res, core_scale, column_scale, ev = optimize_scales(inp, beta)
+
+    x = np.array([1.0, 1.0], dtype=float)
+    best = None
+    history = []
+
+    for _ in range(8):
+        res, core_scale, column_scale, ev = optimize_scales(inp, beta, x0=x)
+        ratio = ev["T_est"] / max(ev["T_target"], 1e-9)
+        history.append((core_scale, column_scale, ev["T_est"], ev["T_target"], ev["drift_ratio"]))
+        best = (res, core_scale, column_scale, ev)
+
+        period_ok_target = abs(ratio - 1.0) <= 0.05
+        upper_ok = ev["T_est"] <= ev["T_upper"]
+        drift_ok_now = ev["drift_ratio"] <= inp.drift_limit_ratio
+        if period_ok_target and upper_ok and drift_ok_now:
+            break
+
+        # Iterative retuning: if too stiff (ratio<1), reduce sections; if too soft, increase them.
+        update_factor = ratio ** 0.75
+        update_factor = min(max(update_factor, 0.80), 1.25)
+        x = np.clip(np.array([core_scale, column_scale]) * update_factor, 0.55, 1.60)
+
+    assert best is not None
+    res, core_scale, column_scale, ev = best
 
     T_ref = ev["T_ref"]
     T_upper = ev["T_upper"]
@@ -744,6 +774,8 @@ def run_design(inp: BuildingInput) -> DesignResult:
         f"T_ref = {T_ref:.3f} s",
         f"T_upper = {T_upper:.3f} s",
         f"T_target = {T_target:.3f} s",
+        f"Final T_est = {T_est:.3f} s",
+        f"Iterations used = {len(history)}",
     ]
     if period_ok:
         messages.append("Upper period check = OK")
@@ -786,7 +818,6 @@ def run_design(inp: BuildingInput) -> DesignResult:
     )
 
 
-# ----------------------------- REPORT / PLOT -----------------------------
 def build_report(result: DesignResult) -> str:
     lines = []
     lines.append("GLOBAL RESPONSE")
