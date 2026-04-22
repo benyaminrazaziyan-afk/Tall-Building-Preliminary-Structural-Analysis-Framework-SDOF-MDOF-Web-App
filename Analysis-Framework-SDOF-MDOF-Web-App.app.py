@@ -11,7 +11,7 @@ from scipy.optimize import minimize
 st.set_page_config(page_title="Tall Building Structural Analysis", layout="wide", initial_sidebar_state="expanded")
 
 AUTHOR_NAME = "Benyamin"
-APP_VERSION = "vFinal"
+APP_VERSION = "v2.2"
 G = 9.81
 STEEL_DENSITY = 7850.0
 
