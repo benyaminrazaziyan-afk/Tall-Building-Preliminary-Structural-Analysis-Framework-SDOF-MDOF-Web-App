@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 from math import pi, sqrt
 from typing import List, Tuple
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
@@ -15,7 +14,7 @@ st.set_page_config(
 )
 
 AUTHOR_NAME = "Benyamin"
-APP_VERSION = "v2.3-streamlit"
+APP_VERSION = "v2.4-streamlit-period-check"
 
 G = 9.81
 STEEL_DENSITY = 7850.0
@@ -174,6 +173,8 @@ class DesignResult:
     total_weight_kN: float
     effective_modal_mass_kg: float
     T_code_s: float
+    T_limit_s: float
+    period_ok: bool
     T_target_s: float
     T_est_s: float
     K_required_N_per_m: float
@@ -715,8 +716,11 @@ def run_design(inp: BuildingInput) -> DesignResult:
     beam_b, beam_h = beam_size_prelim(inp)
     W_total = total_weight_kN(inp, slab_t)
     M_eff = effective_modal_mass(W_total, inp.effective_modal_mass_ratio)
+
     T_code = code_type_period(H, inp.Ct, inp.x_period)
+    T_limit = 1.40 * T_code
     T_target = inp.target_period_factor * T_code
+
     K_req = required_stiffness(M_eff, T_target)
 
     zone_cores = design_core_by_zone(inp, zones)
@@ -729,6 +733,8 @@ def run_design(inp: BuildingInput) -> DesignResult:
     modal = solve_mdof_modes(inp, W_total, K_est, n_modes=5)
 
     T_est = 2.0 * pi * sqrt(M_eff / K_est)
+    period_ok = T_est <= T_limit
+
     top_drift = preliminary_lateral_force_N(inp, W_total) / K_est
     drift_ratio = top_drift / H
 
@@ -739,9 +745,13 @@ def run_design(inp: BuildingInput) -> DesignResult:
     if ratio > 2.0:
         messages.append(f"Warning: T_est/T_target = {ratio:.2f}. The system is much softer than the target.")
     if K_est < K_req:
-        messages.append("Estimated total stiffness is lower than required stiffness from the target period.")
+        messages.append("Estimated total stiffness is lower than required stiffness from the design target period.")
     if drift_ratio > inp.drift_limit_ratio:
         messages.append("Estimated top drift exceeds selected preliminary drift limit.")
+    if period_ok:
+        messages.append(f"Period check OK: T_est = {T_est:.3f} s <= 1.40*T_code = {T_limit:.3f} s.")
+    else:
+        messages.append(f"Period check NOT OK: T_est = {T_est:.3f} s > 1.40*T_code = {T_limit:.3f} s.")
     for zc in zone_cores:
         if zc.story_slenderness > inp.max_story_wall_slenderness:
             messages.append(f"{zc.zone.name}: wall slenderness h/t exceeds selected preliminary limit.")
@@ -751,15 +761,19 @@ def run_design(inp: BuildingInput) -> DesignResult:
         messages.append("Square plan selected: four strong corner columns are emphasized.")
     messages.append("Lower zone includes perimeter retaining walls.")
     messages.append("Upper zones include distributed perimeter shear wall segments in addition to the central core.")
-    messages.append("Period is computed from T = 2π√(M/K_total).")
+    messages.append("Code empirical period uses T_code = Ct * H^x.")
+    messages.append("Design target period is user-defined and separate from the TBDY upper limit.")
     messages.append("MDOF modal analysis added: first 5 natural modes and mode shapes are computed.")
-    if abs(inp.plan_x - inp.plan_y) > 1e-6:
-        messages.append("Rectangular plan detected: directional column dimensions are adjusted in the calculations.")
 
     assessment = (
         "System appears preliminarily adequate."
-        if (K_est >= K_req and drift_ratio <= inp.drift_limit_ratio and T_est <= inp.max_period_factor_over_target * T_target)
-        else "System appears preliminarily too flexible; enlarge walls/columns or refine the stiffness model."
+        if (
+            K_est >= K_req
+            and drift_ratio <= inp.drift_limit_ratio
+            and T_est <= inp.max_period_factor_over_target * T_target
+            and period_ok
+        )
+        else "System appears preliminarily too flexible or exceeds the TBDY period limit; enlarge walls/columns or refine the stiffness model."
     )
 
     return DesignResult(
@@ -768,6 +782,8 @@ def run_design(inp: BuildingInput) -> DesignResult:
         total_weight_kN=W_total,
         effective_modal_mass_kg=M_eff,
         T_code_s=T_code,
+        T_limit_s=T_limit,
+        period_ok=period_ok,
         T_target_s=T_target,
         T_est_s=T_est,
         K_required_N_per_m=K_req,
@@ -793,7 +809,10 @@ def build_report(result: DesignResult) -> str:
     lines.append("GLOBAL RESPONSE")
     lines.append("-" * 74)
     lines.append(f"Estimated period from M/K      = {result.T_est_s:.3f} s")
-    lines.append(f"Target period                  = {result.T_target_s:.3f} s")
+    lines.append(f"Code empirical period          = {result.T_code_s:.3f} s")
+    lines.append(f"TBDY period upper limit        = {result.T_limit_s:.3f} s")
+    lines.append(f"Design target period           = {result.T_target_s:.3f} s")
+    lines.append(f"TBDY period check              = {'OK' if result.period_ok else 'NOT OK'}")
     lines.append(f"Required stiffness             = {result.K_required_N_per_m:,.3e} N/m")
     lines.append(f"Core stiffness                 = {result.K_core_N_per_m:,.3e} N/m")
     lines.append(f"Column stiffness contribution  = {result.K_columns_N_per_m:,.3e} N/m")
@@ -887,7 +906,6 @@ def plot_mode_shapes_like_original(result: DesignResult):
         ax.set_xlim(-1.1, 1.1)
         ax.set_ylim(0.0, H)
 
-        
         if m == 0:
             ax.set_ylabel("Height (m)", fontsize=10)
             ax.set_yticks([0.0, H])
@@ -948,7 +966,7 @@ def _draw_square_plan_like_original(ax, inp: BuildingInput, core: ZoneCoreResult
                 dy = cols.interior_column_y_m
                 color = INTERIOR_COLOR
 
-            _draw_rect(ax, px - dx/2, py - dy/2, dx, dy, color, fill=True, alpha=0.95, lw=0.5)
+            _draw_rect(ax, px - dx / 2, py - dy / 2, dx, dy, color, fill=True, alpha=0.95, lw=0.5)
 
     cx0 = (inp.plan_x - core.core_outer_x) / 2
     cy0 = (inp.plan_y - core.core_outer_y) / 2
@@ -1048,22 +1066,22 @@ def _draw_triangle_plan_like_original(ax, inp: BuildingInput, core: ZoneCoreResu
     for i in range(1, inp.n_bays_x):
         x = inp.plan_x * i / inp.n_bays_x
         y = inp.plan_y
-        _draw_rect(ax, x - cols.perimeter_column_x_m/2, y - cols.perimeter_column_y_m/2,
+        _draw_rect(ax, x - cols.perimeter_column_x_m / 2, y - cols.perimeter_column_y_m / 2,
                    cols.perimeter_column_x_m, cols.perimeter_column_y_m, PERIM_COLOR, fill=True, alpha=0.95)
 
     for i in range(1, inp.n_bays_y):
         x = (inp.plan_x / 2) * (1 - i / inp.n_bays_y)
         y = inp.plan_y * (i / inp.n_bays_y)
-        _draw_rect(ax, x - cols.perimeter_column_x_m/2, y - cols.perimeter_column_y_m/2,
+        _draw_rect(ax, x - cols.perimeter_column_x_m / 2, y - cols.perimeter_column_y_m / 2,
                    cols.perimeter_column_x_m, cols.perimeter_column_y_m, PERIM_COLOR, fill=True, alpha=0.95)
 
     for i in range(1, inp.n_bays_y):
         x = inp.plan_x / 2 + (inp.plan_x / 2) * (i / inp.n_bays_y)
         y = inp.plan_y * (i / inp.n_bays_y)
-        _draw_rect(ax, x - cols.perimeter_column_x_m/2, y - cols.perimeter_column_y_m/2,
+        _draw_rect(ax, x - cols.perimeter_column_x_m / 2, y - cols.perimeter_column_y_m / 2,
                    cols.perimeter_column_x_m, cols.perimeter_column_y_m, PERIM_COLOR, fill=True, alpha=0.95)
 
-    _draw_rect(ax, inp.plan_x / 2 - cols.interior_column_x_m/2, 0.65 * inp.plan_y - cols.interior_column_y_m/2,
+    _draw_rect(ax, inp.plan_x / 2 - cols.interior_column_x_m / 2, 0.65 * inp.plan_y - cols.interior_column_y_m / 2,
                cols.interior_column_x_m, cols.interior_column_y_m, INTERIOR_COLOR, fill=True, alpha=0.95)
 
     cx0 = (inp.plan_x - core.core_outer_x) / 2
@@ -1309,6 +1327,17 @@ with right_col:
     if st.session_state.result is None:
         st.info("Click ANALYZE to display the plan and report, or SHOW 5 MODES to display modal shapes.")
     else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Code period (s)", f"{st.session_state.result.T_code_s:.3f}")
+        c2.metric("TBDY limit (s)", f"{st.session_state.result.T_limit_s:.3f}")
+        c3.metric("Estimated period (s)", f"{st.session_state.result.T_est_s:.3f}")
+        c4.metric("Top drift (m)", f"{st.session_state.result.top_drift_m:.3f}")
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Design target (s)", f"{st.session_state.result.T_target_s:.3f}")
+        d2.metric("Total stiffness (N/m)", f"{st.session_state.result.K_estimated_N_per_m:,.2e}")
+        d3.metric("TBDY check", "OK" if st.session_state.result.period_ok else "NOT OK")
+
         if st.session_state.view_mode == "modes":
             fig_modes = plot_mode_shapes_like_original(st.session_state.result)
             st.pyplot(fig_modes, use_container_width=True)
