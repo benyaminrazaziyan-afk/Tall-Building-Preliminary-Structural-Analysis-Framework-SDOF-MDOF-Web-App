@@ -473,15 +473,77 @@ def weighted_core_stiffness(inp: BuildingInput, zone_cores: List[ZoneCoreResult]
     return 3.0 * EI_equiv / (H**3)
 
 
-def weighted_column_stiffness(inp: BuildingInput, zone_cols: List[ZoneColumnResult]) -> float:
-    H = total_height(inp)
+def build_story_stiffnesses_corrected(inp, K_total: float) -> List[float]:
+    """
+    Corrected version: K_total is cantilever stiffness (3EI/H^3).
+    For a shear building with n stories, we need to find story stiffnesses
+    such that the equivalent cantilever stiffness matches K_total.
+    """
+    n = inp.n_story
+    
+    # Create relative stiffness distribution (triangular, stiffer at base)
+    raw = []
+    for i in range(n):
+        r = i / max(n - 1, 1)
+        raw.append(1.35 - 0.55 * r)
+    
+    # Initial guess based on shear building mechanics
+    k_uniform = K_total * n / 2.5
+    
+    # Apply distribution
+    k_stories = [k_uniform * a for a in raw]
+    
+    # Normalize using harmonic mean to preserve equivalent stiffness
+    k_harmonic = n / sum(1.0/k for k in k_stories)
+    scale = K_total / k_harmonic
+    k_stories = [k * scale for k in k_stories]
+    
+    return k_stories
+
+
+def weighted_column_stiffness_corrected(inp, zone_cols) -> float:
+    """
+    Corrected version: Columns act individually.
+    Each column contributes 12EI/h^3 (fixed-fixed).
+    """
     E = inp.Ec * 1e6
-    total_flex_factor = 0.0
+    h = inp.story_height
+    
+    total_stiffness = 0.0
+    
     for zc in zone_cols:
-        hi = zc.zone.n_stories * inp.story_height
-        total_flex_factor += (hi / H) / max(E * zc.I_col_group_effective_m4, 1e-9)
-    EI_equiv = 1.0 / max(total_flex_factor, 1e-18)
-    return 3.0 * EI_equiv / (H**3)
+        # Column inertia (average of x and y directions)
+        I_corner = (zc.corner_column_x_m * zc.corner_column_y_m**3 + 
+                   zc.corner_column_y_m * zc.corner_column_x_m**3) / 24.0
+        
+        I_perim = (zc.perimeter_column_x_m * zc.perimeter_column_y_m**3 + 
+                  zc.perimeter_column_y_m * zc.perimeter_column_x_m**3) / 24.0
+        
+        I_interior = (zc.interior_column_x_m * zc.interior_column_y_m**3 + 
+                     zc.interior_column_y_m * zc.interior_column_x_m**3) / 24.0
+        
+        # Stiffness per column (fixed-fixed)
+        k_corner = 12 * E * I_corner / h**3
+        k_perim = 12 * E * I_perim / h**3
+        k_interior = 12 * E * I_interior / h**3
+        
+        # Count columns
+        corner_cols = 4
+        perimeter_cols = max(0, 2 * (inp.n_bays_x - 1) + 2 * (inp.n_bays_y - 1))
+        total_cols = (inp.n_bays_x + 1) * (inp.n_bays_y + 1)
+        interior_cols = max(0, total_cols - corner_cols - perimeter_cols)
+        
+        # Total stiffness (parallel)
+        zone_stiffness = (corner_cols * k_corner + 
+                         perimeter_cols * k_perim + 
+                         interior_cols * k_interior)
+        
+        # Weight by zone height
+        zone_height = zc.zone.n_stories * inp.story_height
+        total_stiffness += zone_stiffness * (zone_height / (inp.n_story * inp.story_height))
+    
+    return inp.column_cracked_factor * total_stiffness
+
 
 
 def estimate_reinforcement(inp: BuildingInput, zone_cores: List[ZoneCoreResult], zone_cols: List[ZoneColumnResult], slab_t: float, beam_b: float, beam_h: float) -> ReinforcementEstimate:
@@ -669,6 +731,218 @@ def generate_redesign_suggestions(inp: BuildingInput, T_est: float, T_target: fl
     if not suggestions:
         suggestions.append("Structural system appears preliminarily adequate.")
     return governing_issue, suggestions
+
+f mdof_iterative_loop(
+    inp,
+    zone_cols,
+    T_target: float,
+    max_iter: int = 50,
+    tol_percent: float = 2.0,
+    damping_factor: float = 0.7,
+    verbose: bool = True
+) -> Tuple[List[Dict], float, float]:
+    """
+    ===================================================================
+    لوپ تکرار اصلی برای رسیدن Period به Target
+    ===================================================================
+    
+    مشکل فعلی: Iterations=1, Error=61.93% (بدون تکرار)
+    راه‌حل: این تابع scale factor ها را به صورت خودکار تنظیم می‌کند
+    
+    Parameters:
+    -----------
+    inp : BuildingInput
+        پارامترهای ساختمان
+    zone_cols : List[ZoneColumnResult]
+        نتایج ستون‌ها
+    T_target : float
+        دوره هدف (ثانیه)
+    max_iter : int
+        حداکثر تکرار (پیش‌فرض ۵۰)
+    tol_percent : float
+        خطای مجاز همگرایی %% (پیش‌فرض ۲%%)
+    damping_factor : float
+        فاکتور آرام‌سازی ۰.۵-۰.۸ (پیش‌فرض ۰.۷)
+    verbose : bool
+        نمایش پیشرفت
+    
+    Returns:
+    --------
+    history : List[Dict]
+        تاریخچه تکرارها
+    final_core_scale : float
+        scale نهایی هسته
+    final_col_scale : float
+        scale نهایی ستون‌ها
+    """
+    
+    history = []
+    
+    # مقادیر اولیه scale
+    core_scale = 1.0
+    col_scale = 1.0
+    
+    # محاسبه stiffness پایه (بدون scale)
+    K_core_base = _compute_core_stiffness_base(inp, zone_cols)
+    K_col_base = weighted_column_stiffness_corrected(inp, zone_cols)
+    
+    if verbose:
+        print(f"\\n{'='*60}")
+        print(f"🔧 MDOF ITERATIVE LOOP STARTED")
+        print(f"{'='*60}")
+        print(f"Target Period: {T_target:.4f} s")
+        print(f"Base Core Stiffness: {K_core_base:.3e} N/m")
+        print(f"Base Column Stiffness: {K_col_base:.3e} N/m")
+        print(f"{'='*60}\\n")
+    
+    for iteration in range(1, max_iter + 1):
+        # ==== اعمال scale ====
+        K_core = K_core_base * core_scale
+        K_col = K_col_base * col_scale
+        K_total = K_core + K_col
+        
+        # ==== ساخت story stiffnesses ====
+        k_stories = build_story_stiffnesses_corrected(inp, K_total)
+        
+        # ==== محاسبه Period MDOF ====
+        T_est = _compute_mdof_period_rayleigh(inp, k_stories)
+        
+        # ==== محاسبه خطا ====
+        error_percent = abs((T_est - T_target) / T_target) * 100
+        
+        # ==== محاسبه وزن ====
+        weight = _compute_building_weight(inp, zone_cols, core_scale, col_scale)
+        
+        # ==== ثبت تاریخچه ====
+        history.append({
+            'iter': iteration,
+            'core_scale': round(core_scale, 4),
+            'col_scale': round(col_scale, 4),
+            'T_est': round(T_est, 4),
+            'T_target': round(T_target, 4),
+            'error_percent': round(error_percent, 2),
+            'weight_mn': round(weight, 2),
+            'K_total': K_total
+        })
+        
+        if verbose:
+            print(f"Iter {iteration:2d} | T_est={T_est:.4f}s | "
+                  f"Target={T_target:.4f}s | Error={error_percent:6.2f}% | "
+                  f"CoreSc={core_scale:.3f} | ColSc={col_scale:.3f}")
+        
+        # ==== بررسی همگرایی ====
+        if error_percent <= tol_percent:
+            if verbose:
+                print(f"\\n✅ CONVERGED at iteration {iteration}!")
+                print(f"   Final Period: {T_est:.4f} s (Target: {T_target:.4f} s)")
+                print(f"   Final Error: {error_percent:.2f}%")
+                print(f"   Core Scale: {core_scale:.4f}")
+                print(f"   Column Scale: {col_scale:.4f}")
+            break
+        
+        # ==== منطق تنظیم scale ====
+        # T ∝ 1/√K  →  K_new = K_old × (T_est/T_target)²
+        stiffness_ratio = (T_est / T_target) ** 2
+        
+        # نسبت سهم هسته به کل stiffness
+        core_ratio = K_core / K_total if K_total > 0 else 0.7
+        
+        # مقادیر جدید scale
+        new_core_scale = core_scale * (stiffness_ratio ** core_ratio)
+        new_col_scale = col_scale * (stiffness_ratio ** (1 - core_ratio))
+        
+        # اعمال damping (آرام‌سازی)
+        core_scale = core_scale + damping_factor * (new_core_scale - core_scale)
+        col_scale = col_scale + damping_factor * (new_col_scale - col_scale)
+        
+        # محدودیت‌های ایمنی
+        core_scale = max(0.05, min(15.0, core_scale))
+        col_scale = max(0.05, min(15.0, col_scale))
+    
+    else:
+        if verbose:
+            print(f"\\n⚠️ MAX ITERATIONS ({max_iter}) REACHED!")
+            print(f"   Final Error: {error_percent:.2f}%")
+            print(f"   Consider increasing max_iter or adjusting damping_factor")
+    
+    if verbose:
+        print(f"{'='*60}\\n")
+    
+    return history, core_scale, col_scale
+def _compute_core_stiffness_base(inp, zone_cols):
+    """
+    محاسبه stiffness پایه هسته (بدون scale).
+    ⚠️ این تابع باید با تابع واقعی کد اصلی شما جایگزین شود.
+    
+    فرمول معمول: K_core = 3 × E × I_core / H³
+    """
+    # TODO: جایگزین با تابع واقعی
+    # مثال:
+    # E = inp.Ec * 1e6
+    # H = inp.n_story * inp.story_height
+    # I_core = sum(zc.zone.core_I for zc in zone_cols)
+    # return 3 * E * I_core / H**3
+    
+    # مقدار placeholder - حتماً جایگزین شود!
+    return 1.0e9  # N/m
+
+
+def _compute_mdof_period_rayleigh(inp, k_stories: List[float]) -> float:
+    """
+    محاسبه Period با روش Rayleigh برای ساختمان برشی.
+    ⚠️ این تابع باید با تابع واقعی کد اصلی شما جایگزین شود.
+    
+    فرمول: T = 2π √(Σm_i × u_i² / Σk_i × Δ_i²)
+    """
+    # TODO: جایگزین با تابع واقعی
+    # این فقط یک approximation ساده است
+    
+    n = len(k_stories)
+    m = inp.total_mass / n  # mass per story (approximate)
+    
+    # Shape vector (linear approximation)
+    phi = np.array([(i + 1) / n for i in range(n)])
+    
+    # Mass matrix (lumped)
+    M = m * np.eye(n)
+    
+    # Stiffness matrix (tridiagonal for shear building)
+    K = np.zeros((n, n))
+    for i in range(n):
+        if i == 0:
+            K[i, i] = k_stories[i]
+            if n > 1:
+                K[i, i+1] = -k_stories[i]
+        elif i == n - 1:
+            K[i, i] = k_stories[i-1] + k_stories[i] if i < len(k_stories) else k_stories[i-1]
+            K[i, i-1] = -k_stories[i-1]
+        else:
+            K[i, i] = k_stories[i-1] + k_stories[i]
+            K[i, i-1] = -k_stories[i-1]
+            K[i, i+1] = -k_stories[i]
+    
+    # Make symmetric
+    K = (K + K.T) / 2
+    
+    # Rayleigh quotient
+    num = float(phi @ M @ phi)
+    den = float(phi @ K @ phi)
+    
+    omega = np.sqrt(den / num)
+    T = 2 * np.pi / omega
+    
+    return T
+
+
+def _compute_building_weight(inp, zone_cols, core_scale=1.0, col_scale=1.0):
+    """
+    محاسبه وزن کل ساختمان.
+    ⚠️ این تابع باید با تابع واقعی کد اصلی شما جایگزین شود.
+    """
+    # TODO: جایگزین با تابع واقعی
+    # وزن معمولاً تابعی از ابعاد، تعداد طبقات، و scale ها است
+    base_weight = 8000.0  # MN approximate
+    return base_weight * (1 + 0.1 * (core_scale - 1) + 0.05 * (col_scale - 1))
 
 
 # ----------------------------- OPTIMIZATION -----------------------------
@@ -1086,7 +1360,20 @@ def plot_plan(inp: BuildingInput, result: DesignResult, zone_name: str):
     ax.set_aspect("equal")
     ax.axis("off")
     return fig
+# اجرای لوپ تکرار
+history, final_core_scale, final_col_scale = mdof_iterative_loop(
+    inp=inp,
+    zone_cols=zone_cols,
+    T_target=T_target,      # 4.061s
+    max_iter=50,
+    tol_percent=2.0,        # خطای مجاز 2%
+    damping_factor=0.7
+)
 
+# اعمال scale های نهایی
+for zc in zone_cols:
+    zc.core_scale = final_core_scale   # ~0.12
+    zc.col_scale = final_col_scale     # ~0.21
 
 def plot_mode_shapes(result: DesignResult):
     mr = result.modal_result
