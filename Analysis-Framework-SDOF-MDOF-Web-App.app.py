@@ -16,7 +16,7 @@ st.set_page_config(
 )
 
 AUTHOR_NAME = "Benyamin"
-APP_VERSION = "v3.1-MDOF-Iterative-FIXED"
+APP_VERSION = "v3.1-MDOF"
 
 G = 9.81
 STEEL_DENSITY = 7850.0
