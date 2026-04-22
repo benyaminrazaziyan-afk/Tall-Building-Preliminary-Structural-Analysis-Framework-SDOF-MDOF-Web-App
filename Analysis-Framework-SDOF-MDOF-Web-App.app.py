@@ -67,7 +67,7 @@ class BuildingInput:
 
     prelim_lateral_force_coeff: float = 0.015
     drift_limit_ratio: float = 1 / 500
-    target_period_factor: float = 0.95
+    period_limit_factor: float = 1.40
     max_period_factor_over_target: float = 1.25
 
     min_wall_thickness: float = 0.30
@@ -89,7 +89,6 @@ class BuildingInput:
     slab_rebar_ratio: float = 0.0035
 
     seismic_mass_factor: float = 1.0
-    effective_modal_mass_ratio: float = 0.80
 
     Ct: float = 0.0488
     x_period: float = 0.75
@@ -617,20 +616,51 @@ def estimate_reinforcement(inp: BuildingInput, zone_cores: List[ZoneCoreResult],
     )
 
 
-def evaluate_design(inp: BuildingInput, base_cores: List[ZoneCoreResult], base_cols: List[ZoneColumnResult], slab_t: float, beam_b: float, beam_h: float, M_eff: float, T_target: float, T_limit: float, W_total: float, lambda_core: float, lambda_col: float):
+
+def evaluate_design(
+    inp: BuildingInput,
+    base_cores: List[ZoneCoreResult],
+    base_cols: List[ZoneColumnResult],
+    slab_t: float,
+    beam_b: float,
+    beam_h: float,
+    M_total: float,
+    T_target: float,
+    T_limit: float,
+    W_total: float,
+    lambda_core: float,
+    lambda_col: float,
+):
     zone_cores = scale_core_results(inp, base_cores, lambda_core)
     zone_cols = scale_column_results(inp, base_cols, lambda_col)
 
     K_core = weighted_core_stiffness(inp, zone_cores)
     K_cols = weighted_column_stiffness(inp, zone_cols)
     K_est = K_core + K_cols
-    T_est = 2.0 * pi * sqrt(M_eff / K_est)
+    T_est = 2.0 * pi * sqrt(M_total / K_est)
     drift = preliminary_lateral_force_N(inp, W_total) / K_est
     drift_ratio = drift / total_height(inp)
-    K_req = required_stiffness(M_eff, T_target)
+    K_req = required_stiffness(M_total, T_target)
     reinforcement = estimate_reinforcement(inp, zone_cores, zone_cols, slab_t, beam_b, beam_h)
 
-    objective = (reinforcement.wall_concrete_volume_m3 + reinforcement.column_concrete_volume_m3 + reinforcement.beam_concrete_volume_m3 + reinforcement.slab_concrete_volume_m3) + reinforcement.total_steel_kg / 1000.0
+    weight_proxy = (
+        reinforcement.wall_concrete_volume_m3
+        + reinforcement.column_concrete_volume_m3
+        + reinforcement.beam_concrete_volume_m3
+        + reinforcement.slab_concrete_volume_m3
+        + reinforcement.total_steel_kg / 1000.0
+    )
+
+    period_error = (T_est - T_target) / max(T_target, 1e-9)
+    drift_util = drift_ratio / max(inp.drift_limit_ratio, 1e-9)
+    stiffness_gap = (K_est - K_req) / max(K_req, 1e-9)
+
+    objective = (
+        1.0 * weight_proxy
+        + 4000.0 * period_error**2
+        + 150.0 * max(0.0, drift_util - 1.0) ** 2
+        + 100.0 * max(0.0, T_est - T_limit) ** 2
+    )
 
     return {
         "zone_cores": zone_cores,
@@ -644,44 +674,61 @@ def evaluate_design(inp: BuildingInput, base_cores: List[ZoneCoreResult], base_c
         "drift_ratio": drift_ratio,
         "reinforcement": reinforcement,
         "objective": objective,
+        "weight_proxy": weight_proxy,
+        "period_error": period_error,
+        "stiffness_gap": stiffness_gap,
         "period_ok": T_est <= T_limit,
     }
 
 
-def optimize_design(inp: BuildingInput, base_cores: List[ZoneCoreResult], base_cols: List[ZoneColumnResult], slab_t: float, beam_b: float, beam_h: float, M_eff: float, T_target: float, T_limit: float, W_total: float) -> tuple[OptimizationResult, dict]:
-    def obj(x):
-        ev = evaluate_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_eff, T_target, T_limit, W_total, x[0], x[1])
-        return ev["objective"]
+def optimize_design(
+    inp: BuildingInput,
+    base_cores: List[ZoneCoreResult],
+    base_cols: List[ZoneColumnResult],
+    slab_t: float,
+    beam_b: float,
+    beam_h: float,
+    M_total: float,
+    T_target: float,
+    T_limit: float,
+    W_total: float,
+) -> tuple[OptimizationResult, dict]:
+    def evfun(x):
+        return evaluate_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_total, T_target, T_limit, W_total, x[0], x[1])
 
-    def c_stiff(x):
-        ev = evaluate_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_eff, T_target, T_limit, W_total, x[0], x[1])
-        return ev["K_est"] - ev["K_req"]
+    def obj(x):
+        return evfun(x)["objective"]
 
     def c_drift(x):
-        ev = evaluate_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_eff, T_target, T_limit, W_total, x[0], x[1])
+        ev = evfun(x)
         return inp.drift_limit_ratio - ev["drift_ratio"]
 
     def c_period_limit(x):
-        ev = evaluate_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_eff, T_target, T_limit, W_total, x[0], x[1])
+        ev = evfun(x)
         return T_limit - ev["T_est"]
 
     def c_wall_slenderness(x):
-        ev = evaluate_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_eff, T_target, T_limit, W_total, x[0], x[1])
+        ev = evfun(x)
         return min(inp.max_story_wall_slenderness - z.story_slenderness for z in ev["zone_cores"])
 
-    bounds = [(0.60, 1.60), (0.60, 1.60)]
+    bounds = [(0.45, 1.80), (0.45, 1.80)]
     x0 = np.array([1.0, 1.0])
     constraints = [
-        {"type": "ineq", "fun": c_stiff},
         {"type": "ineq", "fun": c_drift},
         {"type": "ineq", "fun": c_period_limit},
         {"type": "ineq", "fun": c_wall_slenderness},
     ]
 
-    res = opt.minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=constraints, options={"maxiter": 80, "ftol": 1e-6})
+    res = opt.minimize(
+        obj,
+        x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 120, "ftol": 1e-8},
+    )
 
     if not res.success:
-        # fallback to feasible base sizing
         x_best = x0
         message = f"Optimizer fallback used: {res.message}"
         success = False
@@ -692,8 +739,15 @@ def optimize_design(inp: BuildingInput, base_cores: List[ZoneCoreResult], base_c
         success = True
         nit = int(getattr(res, "nit", 0))
 
-    ev = evaluate_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_eff, T_target, T_limit, W_total, float(x_best[0]), float(x_best[1]))
-    opt_result = OptimizationResult(lambda_core=float(x_best[0]), lambda_col=float(x_best[1]), objective_value=float(ev["objective"]), success=success, message=message, n_iterations=nit)
+    ev = evfun([float(x_best[0]), float(x_best[1])])
+    opt_result = OptimizationResult(
+        lambda_core=float(x_best[0]),
+        lambda_col=float(x_best[1]),
+        objective_value=float(ev["objective"]),
+        success=success,
+        message=message,
+        n_iterations=nit,
+    )
     return opt_result, ev
 
 
@@ -797,6 +851,7 @@ def solve_mdof_modes(inp: BuildingInput, total_weight_kN_value: float, K_total: 
 
 
 # ----------------------------- MAIN DESIGN -----------------------------
+
 def run_design(inp: BuildingInput) -> DesignResult:
     H = total_height(inp)
     A = floor_area(inp)
@@ -804,16 +859,16 @@ def run_design(inp: BuildingInput) -> DesignResult:
     slab_t = slab_thickness_prelim(inp)
     beam_b, beam_h = beam_size_prelim(inp)
     W_total = total_weight_kN(inp, slab_t)
-    M_eff = effective_modal_mass(W_total, inp.effective_modal_mass_ratio)
+    M_total = W_total * 1000.0 / G
 
-    T_code = code_type_period(H, inp.Ct, inp.x_period)
-    T_limit = 1.40 * T_code
-    T_target = inp.target_period_factor * T_code
+    T_ref = code_type_period(H, inp.Ct, inp.x_period)
+    T_target = T_ref
+    T_limit = inp.period_limit_factor * T_ref
 
     base_cores = design_core_by_zone(inp, zones)
     base_cols = estimate_zone_column_sizes(inp, zones, slab_t)
 
-    opt_result, ev = optimize_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_eff, T_target, T_limit, W_total)
+    opt_result, ev = optimize_design(inp, base_cores, base_cols, slab_t, beam_b, beam_h, M_total, T_target, T_limit, W_total)
     zone_cores = ev["zone_cores"]
     zone_cols = ev["zone_cols"]
     K_core = ev["K_core"]
@@ -825,40 +880,44 @@ def run_design(inp: BuildingInput) -> DesignResult:
     top_drift = ev["drift"]
     reinforcement = ev["reinforcement"]
     period_ok = ev["period_ok"]
+    period_error = ev["period_error"]
 
     modal = solve_mdof_modes(inp, W_total, K_est, n_modes=5)
+    first_mode_mass = modal.effective_modal_masses_kg[0] if modal.effective_modal_masses_kg else 0.0
 
     messages = []
     messages.append(f"Optimization status: {'SUCCESS' if opt_result.success else 'FALLBACK'} | {opt_result.message}")
     messages.append(f"Optimized lambda_core = {opt_result.lambda_core:.3f}")
     messages.append(f"Optimized lambda_col  = {opt_result.lambda_col:.3f}")
+    messages.append(f"Reference period computed as T_ref = Ct * H^x = {T_ref:.3f} s.")
+    messages.append(f"Design target is set automatically equal to the reference period: {T_target:.3f} s.")
+    messages.append(f"User-defined upper limit factor = {inp.period_limit_factor:.3f}, so T_limit = {T_limit:.3f} s.")
+    messages.append(f"Dynamic period error relative to target = {100.0*period_error:.2f}%.")
     if K_est < K_req:
-        messages.append("Estimated total stiffness is lower than required stiffness from the design target period.")
+        messages.append("Estimated total stiffness is lower than the stiffness corresponding to the target period.")
     if drift_ratio > inp.drift_limit_ratio:
         messages.append("Estimated top drift exceeds selected preliminary drift limit.")
     if period_ok:
-        messages.append(f"Period check OK: T_est = {T_est:.3f} s <= 1.40*T_code = {T_limit:.3f} s.")
+        messages.append(f"Upper-limit period check OK: T_est = {T_est:.3f} s <= T_limit = {T_limit:.3f} s.")
     else:
-        messages.append(f"Period check NOT OK: T_est = {T_est:.3f} s > 1.40*T_code = {T_limit:.3f} s.")
+        messages.append(f"Upper-limit period check NOT OK: T_est = {T_est:.3f} s > T_limit = {T_limit:.3f} s.")
     for zc in zone_cores:
         if zc.story_slenderness > inp.max_story_wall_slenderness:
             messages.append(f"{zc.zone.name}: wall slenderness h/t exceeds selected preliminary limit.")
-    messages.append("Code empirical period uses T_code = Ct * H^x.")
-    messages.append("Design target period drives optimized section scaling.")
-    messages.append("Modal mass participation ratios are computed from M and modal vectors.")
+    messages.append("Modal mass participation ratios are computed directly from the eigenvectors and mass matrix.")
 
     assessment = (
         "System appears preliminarily adequate and optimized."
-        if (K_est >= K_req and drift_ratio <= inp.drift_limit_ratio and period_ok)
-        else "System is not yet adequate; revise constraints, minimum sizes, or the target period."
+        if (abs(period_error) <= 0.05 and drift_ratio <= inp.drift_limit_ratio and period_ok)
+        else "System is not yet fully aligned with the target period / drift / limit checks; revise constraints or sizing assumptions."
     )
 
     return DesignResult(
         H_m=H,
         floor_area_m2=A,
         total_weight_kN=W_total,
-        effective_modal_mass_kg=M_eff,
-        T_code_s=T_code,
+        effective_modal_mass_kg=first_mode_mass,
+        T_code_s=T_ref,
         T_limit_s=T_limit,
         period_ok=period_ok,
         T_target_s=T_target,
@@ -882,24 +941,26 @@ def run_design(inp: BuildingInput) -> DesignResult:
     )
 
 
-# ----------------------------- REPORTING -----------------------------
 def build_report(result: DesignResult) -> str:
+    period_error_pct = 100.0 * (result.T_est_s - result.T_target_s) / max(result.T_target_s, 1e-9)
+
     lines = []
     lines.append("GLOBAL RESPONSE")
     lines.append("-" * 74)
-    lines.append(f"Estimated period from M/K      = {result.T_est_s:.3f} s")
-    lines.append(f"Code empirical period          = {result.T_code_s:.3f} s")
-    lines.append(f"TBDY period upper limit        = {result.T_limit_s:.3f} s")
+    lines.append(f"Reference period               = {result.T_code_s:.3f} s")
     lines.append(f"Design target period           = {result.T_target_s:.3f} s")
-    lines.append(f"TBDY period check              = {'OK' if result.period_ok else 'NOT OK'}")
+    lines.append(f"Estimated dynamic period       = {result.T_est_s:.3f} s")
+    lines.append(f"Allowed upper limit            = {result.T_limit_s:.3f} s")
+    lines.append(f"Period error                   = {period_error_pct:.2f} %")
+    lines.append(f"Upper-limit check             = {'OK' if result.period_ok else 'NOT OK'}")
     lines.append(f"Required stiffness             = {result.K_required_N_per_m:,.3e} N/m")
     lines.append(f"Core stiffness                 = {result.K_core_N_per_m:,.3e} N/m")
     lines.append(f"Column stiffness contribution  = {result.K_columns_N_per_m:,.3e} N/m")
     lines.append(f"Total estimated stiffness      = {result.K_estimated_N_per_m:,.3e} N/m")
     lines.append(f"Estimated top drift            = {result.top_drift_m:.3f} m")
-    lines.append(f"Total structural weight        = {result.total_weight_kN:,.0f} kN")
-    lines.append(f"Effective modal mass (input)   = {result.effective_modal_mass_kg:,.0f} kg")
     lines.append(f"Estimated drift ratio          = {result.drift_ratio:.5f}")
+    lines.append(f"Total structural weight        = {result.total_weight_kN:,.0f} kN")
+    lines.append(f"First-mode effective mass      = {result.effective_modal_mass_kg:,.0f} kg")
     lines.append(f"Beam size (b x h)              = {result.beam_width_m:.2f} x {result.beam_depth_m:.2f} m")
     lines.append(f"Slab thickness                 = {result.slab_thickness_m:.2f} m")
     lines.append("")
@@ -933,7 +994,6 @@ def build_report(result: DesignResult) -> str:
     for m in result.messages:
         lines.append(f"- {m}")
     return "\n".join(lines)
-
 
 # ----------------------------- DISPLAY -----------------------------
 def plot_mode_shapes(result: DesignResult):
@@ -1067,27 +1127,37 @@ def streamlit_input_panel() -> BuildingInput:
         slab_finish_allowance = st.number_input("Slab/fit-out allowance", 0.0, 10.0, 1.5)
         fck = st.number_input("fck (MPa)", 20.0, 100.0, 60.0)
         wall_cracked_factor = st.number_input("Wall cracked factor", 0.1, 1.0, 0.7)
-        target_period_factor = st.number_input("Target period factor", 0.1, 2.0, 0.95)
+        period_limit_factor = st.number_input("Upper period limit factor", 1.0, 3.0, 1.40)
     with c4:
         LL = st.number_input("LL (kN/mÂ²)", 0.0, 20.0, 2.5)
         facade_line_load = st.number_input("Facade line load (kN/m)", 0.0, 50.0, 14.0)
         Ec = st.number_input("Ec (MPa)", 20000.0, 60000.0, 36000.0)
         column_cracked_factor = st.number_input("Column cracked factor", 0.1, 1.0, 0.7)
-        effective_modal_mass_ratio = st.number_input("Effective modal mass ratio", 0.1, 1.0, 0.80)
     return BuildingInput(
         plan_shape=plan_shape,
         n_story=int(n_story), n_basement=int(n_basement), story_height=float(story_height), basement_height=float(basement_height),
         plan_x=float(plan_x), plan_y=float(plan_y), n_bays_x=int(n_bays_x), n_bays_y=int(n_bays_y), bay_x=float(bay_x), bay_y=float(bay_y),
         DL=float(DL), LL=float(LL), slab_finish_allowance=float(slab_finish_allowance), facade_line_load=float(facade_line_load),
         fck=float(fck), Ec=float(Ec), wall_cracked_factor=float(wall_cracked_factor), column_cracked_factor=float(column_cracked_factor),
-        target_period_factor=float(target_period_factor), effective_modal_mass_ratio=float(effective_modal_mass_ratio)
+        period_limit_factor=float(period_limit_factor)
     )
 
 
 # ----------------------------- UI -----------------------------
-st.title("Tall Building Structural Analysis â Optimized")
-author_name = st.text_input("Author name", value=DEFAULT_AUTHOR_NAME)
-st.caption(f"App version {APP_VERSION}")
+st.markdown(
+    """
+    <style>
+    .main .block-container {padding-top: 0.8rem; padding-bottom: 0.8rem; max-width: 100%;}
+    .stButton button {width: 100%; font-weight: 700; height: 3rem; border-radius: 10px;}
+    div[data-testid="stMetric"] {background: #f7f9fc; border: 1px solid #e6ebf2; padding: 0.35rem 0.5rem; border-radius: 10px;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("Tall Building Structural Analysis Framework")
+st.caption(f"Optimized SDOFâMDOF preliminary design tool | Version {APP_VERSION}")
+author_name = st.text_input("Author name shown in report", value=DEFAULT_AUTHOR_NAME)
 
 if "result" not in st.session_state:
     st.session_state.result = None
@@ -1096,9 +1166,10 @@ if "report" not in st.session_state:
 if "view_mode" not in st.session_state:
     st.session_state.view_mode = "plan"
 
-left_col, right_col = st.columns([1.0, 2.1], gap="medium")
+left_col, right_col = st.columns([1.0, 2.2], gap="medium")
 
 with left_col:
+    st.markdown("### Input panel")
     inp = streamlit_input_panel()
     b1, b2, b3 = st.columns(3)
     with b1:
@@ -1122,7 +1193,12 @@ with left_col:
                 st.error(f"Mode display failed: {e}")
     with b3:
         if st.session_state.report:
-            st.download_button("SAVE REPORT", data=st.session_state.report.encode("utf-8"), file_name=f"tall_building_report_{author_name}.txt", mime="text/plain")
+            st.download_button(
+                "SAVE REPORT",
+                data=st.session_state.report.encode("utf-8"),
+                file_name=f"tall_building_report_{author_name}.txt",
+                mime="text/plain",
+            )
         else:
             st.button("SAVE REPORT", disabled=True)
 
@@ -1134,19 +1210,23 @@ with right_col:
         r = st.session_state.result
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Code period (s)", f"{r.T_code_s:.3f}")
-        c2.metric("TBDY limit (s)", f"{r.T_limit_s:.3f}")
+        c2.metric("Upper-limit limit (s)", f"{r.T_limit_s:.3f}")
         c3.metric("Estimated period (s)", f"{r.T_est_s:.3f}")
         c4.metric("Top drift (m)", f"{r.top_drift_m:.3f}")
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("Design target (s)", f"{r.T_target_s:.3f}")
         d2.metric("Core scale", f"{r.optimization.lambda_core:.3f}")
         d3.metric("Column scale", f"{r.optimization.lambda_col:.3f}")
-        d4.metric("TBDY check", "OK" if r.period_ok else "NOT OK")
+        d4.metric("Upper-limit check", "OK" if r.period_ok else "NOT OK")
 
-        if st.session_state.view_mode == "modes":
-            st.pyplot(plot_mode_shapes(r), use_container_width=True)
+        tab1, tab2, tab3 = st.tabs(["Graphic output", "Mass participation", "Report"])
+        with tab1:
+            if st.session_state.view_mode == "modes":
+                st.pyplot(plot_mode_shapes(r), use_container_width=True)
+            else:
+                st.pyplot(plot_plan(inp, r, zone_name), use_container_width=True)
+        with tab2:
             if r.modal_result is not None:
-                st.markdown("**Mass participation**")
                 rows = []
                 for i in range(len(r.modal_result.periods_s)):
                     rows.append({
@@ -1157,8 +1237,8 @@ with right_col:
                         "Eff. mass ratio (%)": round(100 * r.modal_result.effective_mass_ratios[i], 2),
                         "Cumulative (%)": round(100 * r.modal_result.cumulative_effective_mass_ratios[i], 2),
                     })
-                st.dataframe(rows, use_container_width=True)
-        else:
-            st.pyplot(plot_plan(inp, r, zone_name), use_container_width=True)
-
-        st.text_area("", st.session_state.report, height=380, label_visibility="collapsed")
+                st.dataframe(rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("Modal results are not available.")
+        with tab3:
+            st.text_area("", st.session_state.report, height=420, label_visibility="collapsed")
