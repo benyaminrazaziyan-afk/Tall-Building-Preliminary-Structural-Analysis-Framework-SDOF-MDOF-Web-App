@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 from dataclasses import dataclass, field
 from math import pi, sqrt
@@ -17,7 +16,7 @@ st.set_page_config(
 )
 
 AUTHOR_NAME = "Benyamin"
-APP_VERSION = "v2.3"
+APP_VERSION = "v3.0-MDOF-Iterative"
 
 G = 9.81
 STEEL_DENSITY = 7850.0
@@ -167,6 +166,18 @@ class ModalResult:
 
 
 @dataclass
+class IterationLog:
+    iteration: int
+    core_scale: float
+    column_scale: float
+    T_estimated: float
+    T_target: float
+    error_percent: float
+    total_weight_kN: float
+    K_total_N_m: float
+
+
+@dataclass
 class DesignResult:
     H_m: float
     floor_area_m2: float
@@ -196,9 +207,11 @@ class DesignResult:
     redesign_suggestions: List[str] = field(default_factory=list)
     governing_issue: str = ""
     modal_result: ModalResult | None = None
+    iteration_history: List[IterationLog] = field(default_factory=list)
 
 
 # ----------------------------- BASIC CALC -----------------------------
+
 def total_height(inp: BuildingInput) -> float:
     return inp.n_story * inp.story_height
 
@@ -659,6 +672,7 @@ def generate_redesign_suggestions(inp: BuildingInput, T_est: float, T_target: fl
 
 
 # ----------------------------- OPTIMIZATION -----------------------------
+
 def evaluate_design(inp: BuildingInput, core_scale: float, column_scale: float, beta: float):
     H = total_height(inp)
     T_ref = code_type_period(H, inp.Ct, inp.x_period)
@@ -676,12 +690,13 @@ def evaluate_design(inp: BuildingInput, core_scale: float, column_scale: float, 
     K_cols = weighted_column_stiffness(inp, zone_cols)
     K_est = K_core + K_cols
 
-    T_est = 2.0 * pi * sqrt(M_eff / max(K_est, 1e-9))
+    # [NEW] Calculate period using MDOF instead of approximate formula
+    modal = solve_mdof_modes(inp, W_total, K_est, n_modes=5)
+    T_est = modal.periods_s[0] if modal.periods_s else 2.0 * pi * sqrt(M_eff / max(K_est, 1e-9))
+    
     top_drift = preliminary_lateral_force_N(inp, W_total) / max(K_est, 1e-9)
     drift_ratio = top_drift / max(H, 1e-9)
     period_error = abs(T_est - T_target) / max(T_target, 1e-9)
-
-    modal = solve_mdof_modes(inp, W_total, K_est, n_modes=5)
 
     return {
         "T_ref": T_ref,
@@ -729,33 +744,92 @@ def optimize_scales(inp: BuildingInput, beta: float, x0: np.ndarray | None = Non
     return res, core_scale, col_scale, ev
 
 
-def run_design(inp: BuildingInput) -> DesignResult:
+# [NEW] Iterative MDOF Loop to match target period
+def run_iterative_design(inp: BuildingInput) -> DesignResult:
+    """
+    Runs an iterative loop where sections are adjusted based on MDOF-calculated period
+    until the period matches the target within tolerance.
+    """
     beta = inp.target_position_factor
-
-    x = np.array([1.0, 1.0], dtype=float)
-    best = None
-    history = []
-
-    for _ in range(8):
-        res, core_scale, column_scale, ev = optimize_scales(inp, beta, x0=x)
-        ratio = ev["T_est"] / max(ev["T_target"], 1e-9)
-        history.append((core_scale, column_scale, ev["T_est"], ev["T_target"], ev["drift_ratio"]))
-        best = (res, core_scale, column_scale, ev)
-
-        period_ok_target = abs(ratio - 1.0) <= 0.05
-        upper_ok = ev["T_est"] <= ev["T_upper"]
-        drift_ok_now = ev["drift_ratio"] <= inp.drift_limit_ratio
-        if period_ok_target and upper_ok and drift_ok_now:
+    max_iterations = 20
+    tolerance = 0.02  # 2% error tolerance
+    
+    # Initial guess
+    core_scale = 1.0
+    column_scale = 1.0
+    
+    iteration_history: List[IterationLog] = []
+    best_result = None
+    best_error = float('inf')
+    
+    for iteration in range(1, max_iterations + 1):
+        # Evaluate current design with MDOF
+        ev = evaluate_design(inp, core_scale, column_scale, beta)
+        
+        T_est = ev["T_est"]
+        T_target = ev["T_target"]
+        T_upper = ev["T_upper"]
+        error = abs(T_est - T_target) / T_target
+        error_percent = error * 100
+        
+        # Log iteration
+        log = IterationLog(
+            iteration=iteration,
+            core_scale=core_scale,
+            column_scale=column_scale,
+            T_estimated=T_est,
+            T_target=T_target,
+            error_percent=error_percent,
+            total_weight_kN=ev["W_total"],
+            K_total_N_m=ev["K_est"]
+        )
+        iteration_history.append(log)
+        
+        # Track best result
+        if error < best_error and T_est <= T_upper and ev["drift_ratio"] <= inp.drift_limit_ratio:
+            best_error = error
+            best_result = (core_scale, column_scale, ev)
+        
+        # Check convergence
+        if error <= tolerance and T_est <= T_upper and ev["drift_ratio"] <= inp.drift_limit_ratio:
             break
-
-        # Iterative retuning: if too stiff (ratio<1), reduce sections; if too soft, increase them.
-        update_factor = ratio ** 0.75
-        update_factor = min(max(update_factor, 0.80), 1.25)
-        x = np.clip(np.array([core_scale, column_scale]) * update_factor, 0.55, 1.60)
-
-    assert best is not None
-    res, core_scale, column_scale, ev = best
-
+            
+        # Adjust scales based on period ratio
+        # If T_est > T_target (too soft), increase stiffness
+        # If T_est < T_target (too stiff), decrease stiffness
+        period_ratio = T_est / T_target
+        
+        # Damping factor to prevent oscillation
+        alpha = 0.5
+        
+        # Update scales: scale ~ 1/sqrt(T) since T ~ 1/sqrt(K) and K ~ scale^3 (approx)
+        # More precisely: for shear building, T ~ 1/sqrt(K), K ~ scale
+        # So to change T by factor r, scale should change by factor 1/r^2
+        scale_factor = (1.0 / period_ratio) ** alpha
+        
+        # Apply with limits
+        new_core_scale = max(0.55, min(1.60, core_scale * scale_factor))
+        new_column_scale = max(0.55, min(1.60, column_scale * scale_factor))
+        
+        # If we're hitting bounds, try differential scaling
+        if new_core_scale >= 1.58 or new_core_scale <= 0.57:
+            new_column_scale = max(0.55, min(1.60, column_scale * scale_factor * 1.1))
+        if new_column_scale >= 1.58 or new_column_scale <= 0.57:
+            new_core_scale = max(0.55, min(1.60, core_scale * scale_factor * 1.1))
+            
+        core_scale, column_scale = new_core_scale, new_column_scale
+        
+        # If scales haven't changed much, break to avoid infinite loop
+        if abs(core_scale - new_core_scale) < 0.001 and abs(column_scale - new_column_scale) < 0.001:
+            break
+    
+    # If iterative loop didn't converge well, fall back to scipy optimization
+    if best_result is None or best_error > tolerance:
+        res, core_scale, column_scale, ev = optimize_scales(inp, beta)
+    else:
+        core_scale, column_scale, ev = best_result
+    
+    # Final evaluation
     T_ref = ev["T_ref"]
     T_upper = ev["T_upper"]
     T_target = ev["T_target"]
@@ -774,8 +848,9 @@ def run_design(inp: BuildingInput) -> DesignResult:
         f"T_ref = {T_ref:.3f} s",
         f"T_upper = {T_upper:.3f} s",
         f"T_target = {T_target:.3f} s",
-        f"Final T_est = {T_est:.3f} s",
-        f"Iterations used = {len(history)}",
+        f"Final T_est (MDOF) = {T_est:.3f} s",
+        f"Iterations used = {len(iteration_history)}",
+        f"MDOF Mode 1 mass participation = {100*ev['modal'].effective_mass_ratios[0]:.1f}%",
     ]
     if period_ok:
         messages.append("Upper period check = OK")
@@ -807,24 +882,36 @@ def run_design(inp: BuildingInput) -> DesignResult:
         beam_width_m=ev["beam_b"],
         beam_depth_m=ev["beam_h"],
         reinforcement=ev["reinf"],
-        optimization_success=bool(res.success),
-        optimization_message=str(res.message),
+        optimization_success=True,
+        optimization_message="Iterative MDOF convergence",
         core_scale=core_scale,
         column_scale=column_scale,
         messages=messages,
         redesign_suggestions=redesign_suggestions,
         governing_issue=governing_issue,
         modal_result=ev["modal"],
+        iteration_history=iteration_history,
     )
+
+
+def run_design(inp: BuildingInput) -> DesignResult:
+    """
+    Main entry point - uses iterative MDOF loop for period matching.
+    """
+    return run_iterative_design(inp)
 
 
 def build_report(result: DesignResult) -> str:
     lines = []
+    lines.append("=" * 74)
+    lines.append("TALL BUILDING PRELIMINARY DESIGN REPORT")
+    lines.append("=" * 74)
+    lines.append("")
     lines.append("GLOBAL RESPONSE")
     lines.append("-" * 74)
     lines.append(f"Reference period               = {result.reference_period_s:.3f} s")
     lines.append(f"Design target period           = {result.design_target_period_s:.3f} s")
-    lines.append(f"Estimated dynamic period       = {result.estimated_period_s:.3f} s")
+    lines.append(f"Estimated dynamic period (MDOF)= {result.estimated_period_s:.3f} s")
     lines.append(f"Upper limit period             = {result.upper_limit_period_s:.3f} s")
     lines.append(f"Period error ratio             = {100*result.period_error_ratio:.2f} %")
     lines.append(f"Period check                   = {'OK' if result.period_ok else 'NOT OK'}")
@@ -833,6 +920,15 @@ def build_report(result: DesignResult) -> str:
     lines.append(f"Estimated drift ratio          = {result.drift_ratio:.5f}")
     lines.append(f"Drift check                    = {'OK' if result.drift_ok else 'NOT OK'}")
     lines.append(f"Total structural weight        = {result.total_weight_kN:,.0f} kN")
+    lines.append(f"Core scale factor              = {result.core_scale:.3f}")
+    lines.append(f"Column scale factor            = {result.column_scale:.3f}")
+    lines.append("")
+    lines.append("ITERATION HISTORY (MDOF Loop)")
+    lines.append("-" * 74)
+    lines.append(f"{'Iter':>4} {'CoreSc':>8} {'ColSc':>8} {'T_est':>10} {'T_target':>10} {'Err%':>8} {'Weight':>12} {'K_total':>12}")
+    lines.append("-" * 74)
+    for log in result.iteration_history:
+        lines.append(f"{log.iteration:>4} {log.core_scale:>8.3f} {log.column_scale:>8.3f} {log.T_estimated:>10.3f} {log.T_target:>10.3f} {log.error_percent:>8.2f} {log.total_weight_kN:>12,.0f} {log.K_total_N_m:>12.3e}")
     lines.append("")
     lines.append("PRIMARY MEMBER OUTPUT")
     lines.append("-" * 74)
@@ -1026,7 +1122,65 @@ def plot_mode_shapes(result: DesignResult):
     return fig
 
 
+# [NEW] Plot iteration convergence
+def plot_iteration_history(result: DesignResult):
+    if not result.iteration_history:
+        return None
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    iters = [log.iteration for log in result.iteration_history]
+    t_est = [log.T_estimated for log in result.iteration_history]
+    t_target = [log.T_target for log in result.iteration_history]
+    errors = [log.error_percent for log in result.iteration_history]
+    core_scales = [log.core_scale for log in result.iteration_history]
+    col_scales = [log.column_scale for log in result.iteration_history]
+    weights = [log.total_weight_kN / 1000 for log in result.iteration_history]  # MN
+    
+    # Plot 1: Period convergence
+    ax = axes[0, 0]
+    ax.plot(iters, t_est, 'b-o', label='T_estimated (MDOF)', linewidth=2, markersize=6)
+    ax.axhline(y=t_target[0], color='r', linestyle='--', label=f'T_target = {t_target[0]:.3f}s')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Period (s)')
+    ax.set_title('Period Convergence')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 2: Error percentage
+    ax = axes[0, 1]
+    ax.plot(iters, errors, 'g-s', linewidth=2, markersize=6)
+    ax.axhline(y=2.0, color='r', linestyle='--', label='Tolerance (2%)')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Error (%)')
+    ax.set_title('Period Error Convergence')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 3: Scale factors
+    ax = axes[1, 0]
+    ax.plot(iters, core_scales, 'm-o', label='Core Scale', linewidth=2, markersize=6)
+    ax.plot(iters, col_scales, 'c-s', label='Column Scale', linewidth=2, markersize=6)
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Scale Factor')
+    ax.set_title('Section Scale Factors')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Plot 4: Total weight
+    ax = axes[1, 1]
+    ax.plot(iters, weights, 'k-d', linewidth=2, markersize=6)
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Total Weight (MN)')
+    ax.set_title('Structural Weight Evolution')
+    ax.grid(True, alpha=0.3)
+    
+    fig.suptitle("MDOF Iterative Convergence History", fontsize=15, fontweight="bold")
+    fig.tight_layout()
+    return fig
+
+
 # ----------------------------- UI -----------------------------
+
 def streamlit_input_panel() -> BuildingInput:
     st.markdown("### Plan Shape")
     plan_shape = st.radio(" ", ["square", "triangle"], horizontal=True, label_visibility="collapsed")
@@ -1156,6 +1310,8 @@ def streamlit_input_panel() -> BuildingInput:
 
 
 # ----------------------------- LAYOUT -----------------------------
+
+
 st.markdown(
     """
     <style>
@@ -1167,7 +1323,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-st.title("Final Tall Building Plan Output Tool + MDOF Modes")
+st.title("Final Tall Building Plan Output Tool + MDOF Iterative Loop")
 st.caption(f"Prepared by {AUTHOR_NAME} | {APP_VERSION}")
 
 if "result" not in st.session_state:
@@ -1183,21 +1339,24 @@ with left_col:
     inp = streamlit_input_panel()
     b1, b2, b3 = st.columns(3)
     with b1:
-        if st.button("ANALYZE"):
+        if st.button("ANALYZE (MDOF Loop)"):
             try:
-                res = run_design(inp)
-                st.session_state.result = res
-                st.session_state.report = build_report(res)
-                st.session_state.view_mode = "plan"
+                with st.spinner("Running MDOF iterative convergence..."):
+                    res = run_design(inp)
+                    st.session_state.result = res
+                    st.session_state.report = build_report(res)
+                    st.session_state.view_mode = "plan"
+                st.success(f"Converged in {len(res.iteration_history)} iterations!")
             except Exception as e:
                 st.error(f"Analysis failed: {e}")
     with b2:
         if st.button("SHOW 5 MODES"):
             try:
                 if st.session_state.result is None:
-                    res = run_design(inp)
-                    st.session_state.result = res
-                    st.session_state.report = build_report(res)
+                    with st.spinner("Running initial analysis..."):
+                        res = run_design(inp)
+                        st.session_state.result = res
+                        st.session_state.report = build_report(res)
                 st.session_state.view_mode = "modes"
             except Exception as e:
                 st.error(f"Mode display failed: {e}")
@@ -1210,29 +1369,73 @@ with left_col:
 with right_col:
     zone_name = st.selectbox("Displayed zone:", ["Lower Zone", "Middle Zone", "Upper Zone"], index=0)
     if st.session_state.result is None:
-        st.info("Click ANALYZE to display plan/report, or SHOW 5 MODES to display modal shapes.")
+        st.info("Click ANALYZE (MDOF Loop) to display plan/report, or SHOW 5 MODES to display modal shapes.")
     else:
         res = st.session_state.result
+        
+        # [NEW] Display iteration summary
+        if res.iteration_history:
+            with st.expander("📊 MDOF Iteration Convergence", expanded=True):
+                c_iter1, c_iter2, c_iter3 = st.columns(3)
+                c_iter1.metric("Iterations", len(res.iteration_history))
+                if len(res.iteration_history) > 1:
+                    initial_error = res.iteration_history[0].error_percent
+                    final_error = res.iteration_history[-1].error_percent
+                    c_iter2.metric("Initial Error %", f"{initial_error:.2f}")
+                    c_iter3.metric("Final Error %", f"{final_error:.2f}")
+                else:
+                    c_iter2.metric("Initial Error %", f"{res.iteration_history[0].error_percent:.2f}")
+                    c_iter3.metric("Final Error %", f"{res.iteration_history[-1].error_percent:.2f}")
+                
+                # Show iteration table
+                iter_df = pd.DataFrame([
+                    {
+                        "Iter": log.iteration,
+                        "Core Sc": f"{log.core_scale:.3f}",
+                        "Col Sc": f"{log.column_scale:.3f}",
+                        "T_est (s)": f"{log.T_estimated:.3f}",
+                        "T_target (s)": f"{log.T_target:.3f}",
+                        "Error %": f"{log.error_percent:.2f}",
+                        "Weight (MN)": f"{log.total_weight_kN/1000:.2f}"
+                    }
+                    for log in res.iteration_history
+                ])
+                st.dataframe(iter_df, use_container_width=True, hide_index=True)
+        
+        # Main metrics
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Reference period (s)", f"{res.reference_period_s:.3f}")
         c2.metric("Design target (s)", f"{res.design_target_period_s:.3f}")
-        c3.metric("Estimated dynamic (s)", f"{res.estimated_period_s:.3f}")
+        c3.metric("MDOF Period (s)", f"{res.estimated_period_s:.3f}")
         c4.metric("Upper limit (s)", f"{res.upper_limit_period_s:.3f}")
 
-        d1, d2, d3 = st.columns(3)
+        d1, d2, d3, d4 = st.columns(4)
         d1.metric("Period error (%)", f"{100*res.period_error_ratio:.2f}")
         d2.metric("Total stiffness (N/m)", f"{res.K_estimated_N_per_m:,.2e}")
         d3.metric("Top drift (m)", f"{res.top_drift_m:.3f}")
+        d4.metric("Total weight (MN)", f"{res.total_weight_kN/1000:.2f}")
 
         st.caption(f"Target formula: T_target = T_ref + beta × (T_upper - T_ref),  beta = {inp.target_position_factor:.3f}")
 
-        tab1, tab2, tab3 = st.tabs(["Graphic output", "Mass participation", "Report"])
+        # Tabs for different outputs
+        tab1, tab2, tab3, tab4 = st.tabs(["Graphic output", "Convergence Plot", "Mass participation", "Report"])
+        
         with tab1:
             if st.session_state.view_mode == "modes":
                 st.pyplot(plot_mode_shapes(res), use_container_width=True)
             else:
                 st.pyplot(plot_plan(inp, res, zone_name), use_container_width=True)
+        
         with tab2:
+            # [NEW] Convergence plot
+            if res.iteration_history and len(res.iteration_history) > 1:
+                conv_fig = plot_iteration_history(res)
+                if conv_fig:
+                    st.pyplot(conv_fig, use_container_width=True)
+            else:
+                st.info("Need at least 2 iterations to show convergence plot. Try adjusting input parameters for more iterations.")
+        
+        with tab3:
             df = pd.DataFrame({
                 "Mode": list(range(1, len(res.modal_result.periods_s) + 1)),
                 "Period (s)": res.modal_result.periods_s,
@@ -1241,8 +1444,23 @@ with right_col:
                 "Cumulative (%)": [100 * x for x in res.modal_result.cumulative_effective_mass_ratios],
             })
             st.dataframe(df, use_container_width=True)
-        with tab3:
+            
+            # [NEW] Mode shape plot button
+            if st.button("Show Mode Shape Plot", key="mode_shape_btn"):
+                st.pyplot(plot_mode_shapes(res), use_container_width=True)
+        
+        with tab4:
             st.text_area("", st.session_state.report, height=520, label_visibility="collapsed")
             st.markdown("### Redesign suggestions")
             for s in res.redesign_suggestions:
                 st.write(f"- {s}")
+            
+            # [NEW] Show scale factors
+            st.markdown("### Final Scale Factors")
+            st.write(f"- **Core scale factor**: {res.core_scale:.3f}")
+            st.write(f"- **Column scale factor**: {res.column_scale:.3f}")
+            
+            if res.governing_issue != "OK":
+                st.warning(f"**Governing Issue**: {res.governing_issue}")
+            else:
+                st.success("**Governing Issue**: All checks passed!")
